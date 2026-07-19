@@ -1,0 +1,20 @@
+[package]
+name = "sirraya-qutub"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sirraya Labs"]
+description = "A quantum state-vector and density-matrix simulator in Rust, with a quantum reservoir computing module."
+license = "MIT"
+repository = "https://github.com/sirraya-labs/qutub"
+homepage = "https://github.com/sirraya-labs/qutub"
+readme = "README.md"
+keywords = ["quantum", "simulation", "reservoir-computing", "physics"]
+categories = ["science", "simulation"]
+rust-version = "1.75"
+
+[dependencies]
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
