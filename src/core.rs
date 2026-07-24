@@ -690,10 +690,13 @@ impl QuantumRegister {
     pub fn apply_rx(&mut self, target: usize, angle: f64) -> Result<(), String> {
         let cos = (angle / 2.0).cos();
         let sin = (angle / 2.0).sin();
+        // RX(theta) = [[cos, -i*sin], [-i*sin, cos]] — the off-diagonal terms
+        // must carry the imaginary unit, unlike RY which is purely real.
+        let neg_i_sin = Complex::new(0.0, -sin);
         self.apply_single_qubit_gate(target, |left, right| {
             (
-                left.scale(cos) + right.scale(-sin),
-                left.scale(sin) + right.scale(cos)
+                left.scale(cos) + right * neg_i_sin,
+                left * neg_i_sin + right.scale(cos)
             )
         })
     }
@@ -1143,17 +1146,11 @@ impl QuantumRegister {
     }
 
     pub fn trace_distance(&self, other: &Self) -> Result<f64, String> {
-        if self.num_qubits != other.num_qubits {
-            return Err("Quantum registers must have same number of qubits".to_string());
-        }
-
-        let mut distance = 0.0;
-        for i in 0..self.dimension {
-            let diff = self.state_vector[i] - other.state_vector[i];
-            distance += diff.magnitude();
-        }
-
-        Ok(distance / 2.0)
+        // For pure states, trace distance D(psi, phi) = sqrt(1 - |<psi|phi>|^2).
+        // This is gauge-invariant (unlike a raw amplitude-difference norm), so
+        // states that differ only by a global phase correctly give D = 0.
+        let fidelity = self.fidelity(other)?;
+        Ok((1.0 - fidelity).max(0.0).sqrt())
     }
 
     pub fn expectation_value_pauli_z(&self, qubit: usize) -> Result<f64, String> {
@@ -1762,5 +1759,118 @@ mod tests {
         // Control is 1, target1 and target2 should swap: |110⟩ -> |101⟩
         let prob_dist = register.get_probability_distribution();
         assert!((prob_dist.get("101").unwrap_or(&0.0) - 1.0).abs() < EPSILON);
+    }
+
+    // --- Regression tests for the RX/RY bug fix ---
+
+    #[test]
+    fn test_apply_rx_pi_on_zero_gives_minus_i_one() {
+        // RX(pi)|0> = cos(pi/2)|0> - i*sin(pi/2)|1> = -i|1>
+        let mut reg = QuantumRegister::new(1).unwrap();
+        reg.apply_rx(0, PI).unwrap();
+        let state = reg.get_state_vector();
+
+        assert!(
+            state[0].magnitude() < 1e-9,
+            "amplitude of |0> should vanish, got {}", state[0]
+        );
+
+        let expected = Complex::new(0.0, -1.0);
+        assert!(
+            (state[1] - expected).magnitude() < 1e-9,
+            "expected -i|1>, got {}", state[1]
+        );
+    }
+
+    #[test]
+    fn test_apply_rx_differs_from_ry_by_imaginary_unit() {
+        // RX and RY must produce the same measurement probabilities but
+        // different phases: RX puts the off-diagonal amplitude on the
+        // imaginary axis, RY keeps it real. Before the fix, apply_rx was
+        // byte-for-byte identical to apply_ry.
+        let angle = std::f64::consts::FRAC_PI_3;
+
+        let mut rx_reg = QuantumRegister::new(1).unwrap();
+        rx_reg.apply_rx(0, angle).unwrap();
+        let mut ry_reg = QuantumRegister::new(1).unwrap();
+        ry_reg.apply_ry(0, angle).unwrap();
+
+        let rx_state = rx_reg.get_state_vector();
+        let ry_state = ry_reg.get_state_vector();
+
+        // Same probabilities...
+        assert!(
+            (rx_state[0].magnitude_squared() - ry_state[0].magnitude_squared()).abs() < 1e-9
+        );
+        assert!(
+            (rx_state[1].magnitude_squared() - ry_state[1].magnitude_squared()).abs() < 1e-9
+        );
+
+        // ...but RX's |1> amplitude must be purely imaginary...
+        assert!(
+            rx_state[1].imag().abs() > 1e-9,
+            "RX amplitude on |1> should be imaginary, got {}", rx_state[1]
+        );
+        assert!(
+            rx_state[1].real().abs() < 1e-9,
+            "RX amplitude on |1> should have no real part, got {}", rx_state[1]
+        );
+
+        // ...while RY's |1> amplitude must be purely real.
+        assert!(
+            ry_state[1].real().abs() > 1e-9,
+            "RY amplitude on |1> should be real, got {}", ry_state[1]
+        );
+        assert!(
+            ry_state[1].imag().abs() < 1e-9,
+            "RY amplitude on |1> should have no imaginary part, got {}", ry_state[1]
+        );
+    }
+
+    // --- Regression tests for the trace_distance bug fix ---
+
+    #[test]
+    fn test_trace_distance_identical_states_is_zero() {
+        let bell = create_bell_state().unwrap();
+        let distance = bell.trace_distance(&bell).unwrap();
+        assert!(
+            distance.abs() < 1e-6,
+            "identical states should have zero trace distance, got {}", distance
+        );
+    }
+
+    #[test]
+    fn test_trace_distance_orthogonal_states_is_one() {
+        let zero = QuantumRegister::new(1).unwrap();
+        let mut one = QuantumRegister::new(1).unwrap();
+        one.apply_pauli_x(0).unwrap();
+
+        let distance = zero.trace_distance(&one).unwrap();
+        assert!(
+            (distance - 1.0).abs() < 1e-9,
+            "orthogonal states should have trace distance 1, got {}", distance
+        );
+    }
+
+    #[test]
+    fn test_trace_distance_invariant_under_global_phase() {
+        // D(psi, e^{i*theta} * psi) must be 0 — this is exactly what the old
+        // L1-amplitude-difference formula got wrong.
+        let mut original = QuantumRegister::new(1).unwrap();
+        original.apply_hadamard(0).unwrap();
+
+        let mut phase_shifted = QuantumRegister::new(1).unwrap();
+        phase_shifted.apply_hadamard(0).unwrap();
+        let theta = 0.7_f64;
+        let phase = Complex::new(theta.cos(), theta.sin());
+        for amp in phase_shifted.state_vector.iter_mut() {
+            *amp = *amp * phase;
+        }
+
+        let distance = original.trace_distance(&phase_shifted).unwrap();
+        assert!(
+            distance.abs() < 1e-6,
+            "trace distance should be 0 for states differing only by global phase, got {}", distance
+        );
     }
 }
