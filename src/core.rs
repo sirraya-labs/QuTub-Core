@@ -10,6 +10,17 @@ use std::f64::consts::PI;
 use std::time::{Duration, Instant};
 use rand::Rng;
 
+/// A single-qubit Pauli operator, used to specify sparse Pauli-string
+/// observables for `QuantumRegister::expectation_value_pauli_string`.
+/// Qubits not mentioned in a Pauli string are implicitly `I`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauliOp {
+    I,
+    X,
+    Y,
+    Z,
+}
+
 #[derive(Debug, Clone)]
 pub struct DensityMatrix {
     matrix: Vec<Vec<Complex>>,
@@ -204,6 +215,49 @@ impl DensityMatrix {
                 }
                 result[r][c] = result[r][c] + sum.scale(weight);
             }
+        }
+    }
+
+    /// Checks the completeness relation `Sum_k K_k^dagger K_k = I` for a
+    /// set of 2x2 single-qubit Kraus operators (each row-major:
+    /// `[k00, k01, k10, k11]`). This is the defining condition for a
+    /// physically valid quantum channel (Nielsen & Chuang, *Quantum
+    /// Computation and Quantum Information*, Theorem 8.3) -- a channel
+    /// whose Kraus operators violate it does not preserve trace, and will
+    /// silently turn a valid density matrix into one with trace != 1.
+    pub fn validate_kraus_operators(operators: &[[Complex; 4]]) -> Result<(), String> {
+        if operators.is_empty() {
+            return Err("At least one Kraus operator is required".to_string());
+        }
+
+        // sigma = sum_k K_k^dagger K_k, a 2x2 matrix, row-major.
+        let mut sigma = [Complex::zero(); 4];
+        for k in operators {
+            for i in 0..2 {
+                for j in 0..2 {
+                    let mut sum = Complex::zero();
+                    for l in 0..2 {
+                        let k_dag_il = k[l * 2 + i].conjugate();
+                        let k_lj = k[l * 2 + j];
+                        sum = sum + k_dag_il * k_lj;
+                    }
+                    sigma[i * 2 + j] = sigma[i * 2 + j] + sum;
+                }
+            }
+        }
+
+        let diag_ok = (sigma[0] - Complex::one()).magnitude() < 1e-9
+            && (sigma[3] - Complex::one()).magnitude() < 1e-9;
+        let off_diag_ok = sigma[1].magnitude() < 1e-9 && sigma[2].magnitude() < 1e-9;
+
+        if diag_ok && off_diag_ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "Kraus operators do not satisfy the completeness relation \
+                 Sum K^dagger K = I (got diagonal [{}, {}], off-diagonal [{}, {}])",
+                sigma[0], sigma[3], sigma[1], sigma[2]
+            ))
         }
     }
 
@@ -413,14 +467,31 @@ impl DensityMatrix {
     /// simulator targets) and then recover the n eigenvalues of H by
     /// taking every duplicated pair once.
     fn hermitian_eigenvalues(&self) -> Vec<f64> {
-        let n = self.dimension;
+        Self::hermitian_eigenvalues_of(&self.matrix)
+    }
+
+    /// Full eigenvalue spectrum of an arbitrary Hermitian matrix (not
+    /// necessarily this DensityMatrix's own `matrix` -- used internally
+    /// for computations that involve two different density matrices,
+    /// such as mixed-state fidelity and concurrence).
+    ///
+    /// A complex Hermitian matrix H = A + iB (A real symmetric, B real
+    /// skew-symmetric) has the same eigenvalues -- each with doubled
+    /// multiplicity -- as the real symmetric 2n x 2n block matrix
+    /// M = [[A, -B], [B, A]]. This lets us diagonalize via the classical
+    /// cyclic Jacobi eigenvalue algorithm on a real symmetric matrix
+    /// (numerically simple and robust for the small dimensions this
+    /// simulator targets) and then recover the n eigenvalues of H by
+    /// taking every duplicated pair once.
+    fn hermitian_eigenvalues_of(matrix: &[Vec<Complex>]) -> Vec<f64> {
+        let n = matrix.len();
         let m = 2 * n;
         let mut real_block = vec![vec![0.0f64; m]; m];
 
         for i in 0..n {
             for j in 0..n {
-                let a = self.matrix[i][j].real(); // symmetric part
-                let b = self.matrix[i][j].imag(); // skew-symmetric part
+                let a = matrix[i][j].real(); // symmetric part
+                let b = matrix[i][j].imag(); // skew-symmetric part
                 real_block[i][j] = a;
                 real_block[i][j + n] = -b;
                 real_block[i + n][j] = b;
@@ -428,7 +499,7 @@ impl DensityMatrix {
             }
         }
 
-        let mut eigenvalues = Self::jacobi_eigenvalues(&mut real_block);
+        let (mut eigenvalues, _) = Self::jacobi_eigen(&mut real_block);
         eigenvalues.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
         // Each true eigenvalue of H appears twice (adjacently, once sorted)
@@ -436,15 +507,96 @@ impl DensityMatrix {
         eigenvalues.into_iter().step_by(2).collect()
     }
 
+    /// Matrix square root of an arbitrary Hermitian positive-semidefinite
+    /// matrix. Reuses the same complex-to-real block embedding as
+    /// `hermitian_eigenvalues_of`: because that embedding is an algebra
+    /// homomorphism, it commutes with any analytic functional calculus
+    /// (in particular the square root), so `block(sqrt(H)) = sqrt(block(H))`.
+    /// That lets the square root be computed with only real-valued Jacobi
+    /// diagonalization -- diagonalize the real block, take the elementwise
+    /// square root of its (non-negative, since H is PSD) eigenvalues, and
+    /// reconstruct via `V * diag(sqrt(lambda)) * V^T` -- then read the
+    /// complex result straight off the block structure.
+    fn hermitian_sqrt_of(matrix: &[Vec<Complex>]) -> Vec<Vec<Complex>> {
+        let n = matrix.len();
+        let m = 2 * n;
+        let mut real_block = vec![vec![0.0f64; m]; m];
+
+        for i in 0..n {
+            for j in 0..n {
+                let a = matrix[i][j].real();
+                let b = matrix[i][j].imag();
+                real_block[i][j] = a;
+                real_block[i][j + n] = -b;
+                real_block[i + n][j] = b;
+                real_block[i + n][j + n] = a;
+            }
+        }
+
+        let (eigenvalues, eigenvectors) = Self::jacobi_eigen(&mut real_block);
+
+        // Reconstruct sqrt(M) = V * diag(sqrt(max(lambda, 0))) * V^T.
+        // Negative eigenvalues (which shouldn't occur for a true density
+        // matrix, only from floating-point error) are clamped to zero
+        // rather than propagated as NaN.
+        let mut sqrt_block = vec![vec![0.0f64; m]; m];
+        for i in 0..m {
+            for j in 0..m {
+                let mut sum = 0.0;
+                for k in 0..m {
+                    sum += eigenvectors[i][k] * eigenvalues[k].max(0.0).sqrt() * eigenvectors[j][k];
+                }
+                sqrt_block[i][j] = sum;
+            }
+        }
+
+        // block(sqrt(H)) has the same [[A', -B'], [B', A']] structure as
+        // any block(complex matrix), so sqrt(H) = A' + iB' is read
+        // straight off the top-left and bottom-left blocks.
+        let mut result = vec![vec![Complex::zero(); n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                result[i][j] = Complex::new(sqrt_block[i][j], sqrt_block[i + n][j]);
+            }
+        }
+        result
+    }
+
+    /// Dense n x n complex matrix multiply. Used internally by
+    /// mixed-state fidelity and concurrence, both of which are only ever
+    /// called on small (single- or two-qubit) matrices, so the O(n^3)
+    /// cost here is not a concern.
+    fn complex_matmul(a: &[Vec<Complex>], b: &[Vec<Complex>]) -> Vec<Vec<Complex>> {
+        let n = a.len();
+        let mut result = vec![vec![Complex::zero(); n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = Complex::zero();
+                for k in 0..n {
+                    sum = sum + a[i][k] * b[k][j];
+                }
+                result[i][j] = sum;
+            }
+        }
+        result
+    }
+
     /// Classical cyclic Jacobi eigenvalue algorithm for a real symmetric
     /// matrix. Repeatedly zeroes the largest off-diagonal element via a
     /// Givens rotation until the matrix is (numerically) diagonal, then
     /// returns the diagonal (the eigenvalues). O(n^3) per sweep; a handful
     /// of sweeps is enough to converge for the small matrices used here.
-    fn jacobi_eigenvalues(a: &mut [Vec<f64>]) -> Vec<f64> {
+    fn jacobi_eigen(a: &mut [Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
         let n = a.len();
         if n == 0 {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
+        }
+
+        // V accumulates the product of all rotations; its columns converge
+        // to the orthonormal eigenvectors of the original matrix.
+        let mut v = vec![vec![0.0f64; n]; n];
+        for i in 0..n {
+            v[i][i] = 1.0;
         }
 
         // Scale-relative convergence threshold: EPSILON alone is far too
@@ -484,20 +636,28 @@ impl DensityMatrix {
                 break;
             }
 
-            if a[p][p] == a[q][q] {
+            let (c, s) = if a[p][p] == a[q][q] {
                 // 45 degree rotation when diagonal entries are equal
-                let (c, s) = (std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2 * a[p][q].signum());
-                Self::apply_jacobi_rotation(a, p, q, c, s);
+                (std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2 * a[p][q].signum())
             } else {
                 let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
                 let t = theta.signum() / (theta.abs() + (1.0 + theta * theta).sqrt());
                 let c = 1.0 / (1.0 + t * t).sqrt();
-                let s = t * c;
-                Self::apply_jacobi_rotation(a, p, q, c, s);
+                (c, t * c)
+            };
+            Self::apply_jacobi_rotation(a, p, q, c, s);
+
+            // Accumulate the same rotation into V's columns p, q.
+            for i in 0..n {
+                let vip = v[i][p];
+                let viq = v[i][q];
+                v[i][p] = c * vip - s * viq;
+                v[i][q] = s * vip + c * viq;
             }
         }
 
-        (0..n).map(|i| a[i][i]).collect()
+        let eigenvalues = (0..n).map(|i| a[i][i]).collect();
+        (eigenvalues, v)
     }
 
     fn apply_jacobi_rotation(a: &mut [Vec<f64>], p: usize, q: usize, c: f64, s: f64) {
@@ -521,6 +681,221 @@ impl DensityMatrix {
                 a[q][i] = a[i][q];
             }
         }
+    }
+
+    /// Reduced density matrix Tr_B(rho_AB): traces out every qubit not
+    /// listed in `keep`, leaving the density matrix of the retained
+    /// subsystem (Nielsen & Chuang, Sec. 2.4.3). This is the standard
+    /// tool for entanglement entropy of a subsystem -- e.g. computing
+    /// `register.to_density_matrix()?.partial_trace(&[0])?.von_neumann_entropy()`
+    /// gives the real reduced-state entropy of qubit 0, as opposed to
+    /// simulating decoherence via a depolarizing channel.
+    ///
+    /// Runtime is O(dimension^2), i.e. O(4^n) in the number of qubits --
+    /// fine for the small registers this simulator targets, but not
+    /// intended for anything past the ~10 qubit range where dense
+    /// density-matrix operations already become the bottleneck elsewhere
+    /// in this module.
+    pub fn partial_trace(&self, keep: &[usize]) -> Result<DensityMatrix, String> {
+        for &q in keep {
+            if q >= self.num_qubits {
+                return Err(format!("Qubit index {} out of bounds for {} qubits", q, self.num_qubits));
+            }
+        }
+
+        let mut keep_sorted = keep.to_vec();
+        keep_sorted.sort();
+        keep_sorted.dedup();
+        if keep_sorted.len() != keep.len() {
+            return Err("Duplicate qubit indices in `keep`".to_string());
+        }
+        if keep_sorted.is_empty() {
+            return Err("`keep` must retain at least one qubit".to_string());
+        }
+
+        let trace_out: Vec<usize> = (0..self.num_qubits)
+            .filter(|q| !keep_sorted.contains(q))
+            .collect();
+
+        let extract = |idx: usize, qubits: &[usize]| -> usize {
+            let mut out = 0usize;
+            for (pos, &q) in qubits.iter().enumerate() {
+                if (idx >> q) & 1 == 1 {
+                    out |= 1 << pos;
+                }
+            }
+            out
+        };
+
+        let k = keep_sorted.len();
+        let reduced_dim = 1usize << k;
+        let mut reduced = vec![vec![Complex::zero(); reduced_dim]; reduced_dim];
+
+        for i in 0..self.dimension {
+            for j in 0..self.dimension {
+                // Partial trace sums over matching diagonal entries of the
+                // traced-out subsystem: <i_keep, k| rho |j_keep, k> summed
+                // over k, so only pairs that agree on the traced-out bits
+                // contribute.
+                if extract(i, &trace_out) != extract(j, &trace_out) {
+                    continue;
+                }
+                let ri = extract(i, &keep_sorted);
+                let rj = extract(j, &keep_sorted);
+                reduced[ri][rj] = reduced[ri][rj] + self.matrix[i][j];
+            }
+        }
+
+        Ok(DensityMatrix {
+            matrix: reduced,
+            num_qubits: k,
+            dimension: reduced_dim,
+        })
+    }
+
+    /// Validates that this is a mathematically well-formed density
+    /// operator: trace 1, Hermitian, and positive semi-definite (Nielsen
+    /// & Chuang, Sec. 2.4 -- the three defining properties of a density
+    /// matrix). Intended as an opt-in sanity check -- e.g. after
+    /// constructing a `DensityMatrix` from untrusted data, or in tests --
+    /// rather than something called on every operation, since the PSD
+    /// check requires a full eigenvalue decomposition.
+    pub fn is_valid(&self) -> Result<(), String> {
+        let trace = self.trace();
+        if (trace - 1.0).abs() > 1e-6 {
+            return Err(format!("Trace must be 1, got {}", trace));
+        }
+
+        for i in 0..self.dimension {
+            for j in 0..self.dimension {
+                let diff = self.matrix[i][j] - self.matrix[j][i].conjugate();
+                if diff.magnitude() > 1e-6 {
+                    return Err(format!(
+                        "Matrix is not Hermitian: entry ({}, {}) = {} but conjugate of entry ({}, {}) = {}",
+                        i, j, self.matrix[i][j], j, i, self.matrix[j][i].conjugate()
+                    ));
+                }
+            }
+        }
+
+        let min_eigenvalue = self.hermitian_eigenvalues()
+            .into_iter()
+            .fold(f64::INFINITY, f64::min);
+        if min_eigenvalue < -1e-6 {
+            return Err(format!(
+                "Matrix is not positive semi-definite: smallest eigenvalue is {}",
+                min_eigenvalue
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Mixed-state (Uhlmann) fidelity: `F(rho, sigma) = (Tr sqrt(sqrt(rho) sigma sqrt(rho)))^2`
+    /// (Uhlmann 1976; Jozsa, *J. Mod. Opt.* 1994; Nielsen & Chuang eq. 9.53).
+    /// Reduces to the pure-state overlap `|<psi|phi>|^2` used by
+    /// `QuantumRegister::fidelity` when both states happen to be pure.
+    pub fn fidelity(&self, other: &Self) -> Result<f64, String> {
+        if self.num_qubits != other.num_qubits {
+            return Err("Density matrices must have the same number of qubits".to_string());
+        }
+
+        let sqrt_rho = Self::hermitian_sqrt_of(&self.matrix);
+        let inner = Self::complex_matmul(&sqrt_rho, &other.matrix);
+        let product = Self::complex_matmul(&inner, &sqrt_rho);
+        let eigenvalues = Self::hermitian_eigenvalues_of(&product);
+
+        let trace_sqrt: f64 = eigenvalues.iter().map(|&l| l.max(0.0).sqrt()).sum();
+        Ok((trace_sqrt * trace_sqrt).min(1.0))
+    }
+
+    /// Wootters concurrence for a two-qubit density matrix (Wootters,
+    /// *Phys. Rev. Lett.* 80, 2245 (1998)): an entanglement measure
+    /// ranging from 0 (separable) to 1 (maximally entangled, e.g. a Bell
+    /// state). Computed as `max(0, lambda_1 - lambda_2 - lambda_3 - lambda_4)`,
+    /// where the lambdas are the square roots (sorted descending) of the
+    /// eigenvalues of `rho * rho_tilde`, and `rho_tilde = (Y tensor Y) rho* (Y tensor Y)`
+    /// is the "spin-flipped" density matrix.
+    pub fn concurrence(&self) -> Result<f64, String> {
+        if self.dimension != 4 {
+            return Err("Concurrence is only defined for two-qubit (4x4) density matrices".to_string());
+        }
+
+        // Y tensor Y in the computational basis, matching this module's
+        // qubit-to-bit-position convention (qubit q at bit position q).
+        let y = [
+            Complex::zero(), Complex::new(0.0, -1.0),
+            Complex::new(0.0, 1.0), Complex::zero(),
+        ];
+        let mut yy = vec![vec![Complex::zero(); 4]; 4];
+        for i in 0..4 {
+            let i1 = (i >> 1) & 1;
+            let i0 = i & 1;
+            for j in 0..4 {
+                let j1 = (j >> 1) & 1;
+                let j0 = j & 1;
+                yy[i][j] = y[i1 * 2 + j1] * y[i0 * 2 + j0];
+            }
+        }
+
+        // rho* : entrywise complex conjugate (not conjugate-transpose).
+        let mut rho_star = vec![vec![Complex::zero(); 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                rho_star[i][j] = self.matrix[i][j].conjugate();
+            }
+        }
+
+        let rho_tilde = Self::complex_matmul(&Self::complex_matmul(&yy, &rho_star), &yy);
+        let sqrt_rho = Self::hermitian_sqrt_of(&self.matrix);
+        let m = Self::complex_matmul(&Self::complex_matmul(&sqrt_rho, &rho_tilde), &sqrt_rho);
+
+        let mut eigenvalues = Self::hermitian_eigenvalues_of(&m);
+        eigenvalues.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+        let lambdas: Vec<f64> = eigenvalues.iter().map(|&l| l.max(0.0).sqrt()).collect();
+        Ok((lambdas[0] - lambdas[1] - lambdas[2] - lambdas[3]).max(0.0))
+    }
+
+    /// Negativity of the bipartition (`subsystem_b` vs. its complement):
+    /// `N(rho) = sum of |lambda_i|` over the negative eigenvalues lambda_i
+    /// of the partial transpose `rho^(T_B)` (Peres, *PRL* 1996;
+    /// Vidal & Werner, *Phys. Rev. A* 65, 032314 (2002)). A nonzero value
+    /// certifies entanglement across the cut (the Peres-Horodecki / PPT
+    /// criterion); unlike concurrence this generalizes to any bipartition
+    /// of a multi-qubit density matrix, not just two qubits.
+    pub fn negativity(&self, subsystem_b: &[usize]) -> Result<f64, String> {
+        for &q in subsystem_b {
+            if q >= self.num_qubits {
+                return Err(format!("Qubit index {} out of bounds for {} qubits", q, self.num_qubits));
+            }
+        }
+
+        let mut b_sorted = subsystem_b.to_vec();
+        b_sorted.sort();
+        b_sorted.dedup();
+        if b_sorted.len() != subsystem_b.len() {
+            return Err("Duplicate qubit indices in subsystem_b".to_string());
+        }
+        if b_sorted.is_empty() || b_sorted.len() >= self.num_qubits {
+            return Err("subsystem_b must be a proper, non-empty subset of the qubits".to_string());
+        }
+
+        let b_mask: usize = b_sorted.iter().map(|&q| 1usize << q).sum();
+
+        // Partial transpose over B: swap the B-bits between the row and
+        // column index while leaving the A-bits fixed.
+        let mut transposed = vec![vec![Complex::zero(); self.dimension]; self.dimension];
+        for i in 0..self.dimension {
+            for j in 0..self.dimension {
+                let i_src = (i & !b_mask) | (j & b_mask);
+                let j_src = (j & !b_mask) | (i & b_mask);
+                transposed[i][j] = self.matrix[i_src][j_src];
+            }
+        }
+
+        let eigenvalues = Self::hermitian_eigenvalues_of(&transposed);
+        Ok(eigenvalues.iter().filter(|&&l| l < 0.0).map(|l| l.abs()).sum())
     }
 
     pub fn print_density_matrix(&self) {
@@ -603,7 +978,9 @@ impl QuantumRegister {
         Ok(())
     }
 
-    /// Convert a basis index to MSB-first bitstring (qubit 0 on the left)
+    /// Convert a basis index to a bitstring with qubit (num_qubits - 1) on
+    /// the left (most significant) and qubit 0 on the right (least
+    /// significant) -- i.e. standard binary notation for `index`.
     fn index_to_bitstring(&self, index: usize) -> String {
         let mut s = String::with_capacity(self.num_qubits);
         // Iterate from highest bit (MSB) to lowest bit (LSB)
@@ -721,6 +1098,110 @@ impl QuantumRegister {
                 right * phase2
             )
         })
+    }
+
+    /// RXX(theta) = exp(-i*theta/2 * X tensor X), the Ising XX-coupling
+    /// gate. Standard entangling rotation in variational ansatze (VQE,
+    /// QAOA mixers) and gate-model chemistry circuits; matches the
+    /// Qiskit `RXXGate` / Pennylane `IsingXX` convention.
+    pub fn apply_rxx(&mut self, qubit_a: usize, qubit_b: usize, angle: f64) -> Result<(), String> {
+        self.validate_qubit_index(qubit_a)?;
+        self.validate_qubit_index(qubit_b)?;
+        if qubit_a == qubit_b {
+            return Err("RXX requires two distinct qubits".to_string());
+        }
+
+        let cos = (angle / 2.0).cos();
+        let neg_i_sin = Complex::new(0.0, -(angle / 2.0).sin());
+        let mask_a = 1usize << qubit_a;
+        let mask_b = 1usize << qubit_b;
+        let pair_mask = mask_a | mask_b;
+
+        for base in 0..self.dimension {
+            // Process each of the 4 combinations of (qubit_a, qubit_b)
+            // exactly once, keyed by the state with both bits cleared.
+            if base & pair_mask != 0 {
+                continue;
+            }
+            let s00 = base;
+            let s01 = base | mask_b;
+            let s10 = base | mask_a;
+            let s11 = base | pair_mask;
+
+            let a00 = self.state_vector[s00];
+            let a01 = self.state_vector[s01];
+            let a10 = self.state_vector[s10];
+            let a11 = self.state_vector[s11];
+
+            self.state_vector[s00] = a00.scale(cos) + a11 * neg_i_sin;
+            self.state_vector[s11] = a11.scale(cos) + a00 * neg_i_sin;
+            self.state_vector[s01] = a01.scale(cos) + a10 * neg_i_sin;
+            self.state_vector[s10] = a10.scale(cos) + a01 * neg_i_sin;
+        }
+        Ok(())
+    }
+
+    /// RYY(theta) = exp(-i*theta/2 * Y tensor Y), the Ising YY-coupling
+    /// gate (Qiskit `RYYGate` / Pennylane `IsingYY` convention).
+    pub fn apply_ryy(&mut self, qubit_a: usize, qubit_b: usize, angle: f64) -> Result<(), String> {
+        self.validate_qubit_index(qubit_a)?;
+        self.validate_qubit_index(qubit_b)?;
+        if qubit_a == qubit_b {
+            return Err("RYY requires two distinct qubits".to_string());
+        }
+
+        let cos = (angle / 2.0).cos();
+        let sin = (angle / 2.0).sin();
+        let i_sin = Complex::new(0.0, sin);
+        let neg_i_sin = Complex::new(0.0, -sin);
+        let mask_a = 1usize << qubit_a;
+        let mask_b = 1usize << qubit_b;
+        let pair_mask = mask_a | mask_b;
+
+        for base in 0..self.dimension {
+            if base & pair_mask != 0 {
+                continue;
+            }
+            let s00 = base;
+            let s01 = base | mask_b;
+            let s10 = base | mask_a;
+            let s11 = base | pair_mask;
+
+            let a00 = self.state_vector[s00];
+            let a01 = self.state_vector[s01];
+            let a10 = self.state_vector[s10];
+            let a11 = self.state_vector[s11];
+
+            self.state_vector[s00] = a00.scale(cos) + a11 * i_sin;
+            self.state_vector[s11] = a11.scale(cos) + a00 * i_sin;
+            self.state_vector[s01] = a01.scale(cos) + a10 * neg_i_sin;
+            self.state_vector[s10] = a10.scale(cos) + a01 * neg_i_sin;
+        }
+        Ok(())
+    }
+
+    /// RZZ(theta) = exp(-i*theta/2 * Z tensor Z), the Ising ZZ-coupling
+    /// gate (Qiskit `RZZGate` / Pennylane `IsingZZ` convention). Diagonal
+    /// in the computational basis: a pure phase gate, no amplitude mixing.
+    pub fn apply_rzz(&mut self, qubit_a: usize, qubit_b: usize, angle: f64) -> Result<(), String> {
+        self.validate_qubit_index(qubit_a)?;
+        self.validate_qubit_index(qubit_b)?;
+        if qubit_a == qubit_b {
+            return Err("RZZ requires two distinct qubits".to_string());
+        }
+
+        let phase_same = Complex::new(0.0, -angle / 2.0).exp(); // parity +1 (00 or 11)
+        let phase_diff = Complex::new(0.0, angle / 2.0).exp();  // parity -1 (01 or 10)
+        let mask_a = 1usize << qubit_a;
+        let mask_b = 1usize << qubit_b;
+
+        for i in 0..self.dimension {
+            let bit_a = (i & mask_a) != 0;
+            let bit_b = (i & mask_b) != 0;
+            let phase = if bit_a == bit_b { phase_same } else { phase_diff };
+            self.state_vector[i] = self.state_vector[i] * phase;
+        }
+        Ok(())
     }
 
     pub fn apply_cnot(&mut self, control: usize, target: usize) -> Result<(), String> {
@@ -1167,6 +1648,44 @@ impl QuantumRegister {
         Ok(expectation)
     }
 
+    /// Expectation value of an arbitrary Pauli-string observable, given as
+    /// a sparse list of `(qubit, PauliOp)` terms -- qubits not listed are
+    /// implicitly `I`. This is the standard interface for estimating
+    /// observables in VQE-style algorithms (cf. Qiskit's
+    /// `Statevector.expectation_value`, Cirq's `PauliString`). A sparse
+    /// `(qubit, op)` list is used rather than a dense per-qubit string to
+    /// avoid any ambiguity with this module's qubit-to-bit-position
+    /// convention.
+    ///
+    /// Computed as `<psi|P|psi> = <psi | (P|psi>)>`: apply P to a scratch
+    /// copy of the state and take the inner product with the original,
+    /// reusing the existing single-qubit gate machinery rather than
+    /// building a dense Pauli-string matrix.
+    pub fn expectation_value_pauli_string(&self, terms: &[(usize, PauliOp)]) -> Result<f64, String> {
+        let qubits: Vec<usize> = terms.iter().map(|&(q, _)| q).collect();
+        self.validate_qubit_indices(&qubits)?;
+
+        let mut scratch = self.clone();
+        for &(qubit, op) in terms {
+            match op {
+                PauliOp::I => {}
+                PauliOp::X => scratch.apply_pauli_x(qubit)?,
+                PauliOp::Y => scratch.apply_pauli_y(qubit)?,
+                PauliOp::Z => scratch.apply_pauli_z(qubit)?,
+            }
+        }
+
+        let mut overlap = Complex::zero();
+        for i in 0..self.dimension {
+            overlap = overlap + self.state_vector[i].conjugate() * scratch.state_vector[i];
+        }
+
+        // <psi|P|psi> for a Hermitian P is guaranteed real; the imaginary
+        // part is discarded (it is zero, up to floating-point error, for
+        // any valid Pauli string).
+        Ok(overlap.real())
+    }
+
     pub fn to_density_matrix(&self) -> Result<DensityMatrix, String> {
         DensityMatrix::from_state_vector(&self.state_vector)
     }
@@ -1433,6 +1952,28 @@ pub fn create_ghz_state(num_qubits: usize) -> Result<QuantumRegister, String> {
     for i in 1..num_qubits {
         register.apply_cnot(0, i)?;
     }
+    Ok(register)
+}
+
+/// W state: an equal superposition of every single-excitation basis
+/// state, `(|10..0> + |01..0> + ... + |00..1>) / sqrt(n)`. Unlike the GHZ
+/// state, the W state's entanglement survives losing any one qubit,
+/// which is why it's the standard alternative benchmark representative
+/// for genuine multipartite entanglement (Dur, Vidal & Cirac,
+/// *Phys. Rev. A* 62, 062314 (2000), which showed GHZ and W states are
+/// not interconvertible by local operations -- i.e. they represent two
+/// inequivalent classes of tripartite-or-more entanglement).
+pub fn create_w_state(num_qubits: usize) -> Result<QuantumRegister, String> {
+    let mut register = QuantumRegister::new(num_qubits)?;
+    let amplitude = Complex::new(1.0 / (num_qubits as f64).sqrt(), 0.0);
+
+    for amp in register.state_vector.iter_mut() {
+        *amp = Complex::zero();
+    }
+    for q in 0..num_qubits {
+        register.state_vector[1usize << q] = amplitude;
+    }
+
     Ok(register)
 }
 
@@ -1872,5 +2413,239 @@ mod tests {
             distance.abs() < 1e-6,
             "trace distance should be 0 for states differing only by global phase, got {}", distance
         );
+    }
+
+    // --- partial_trace ---
+
+    #[test]
+    fn test_partial_trace_bell_state_gives_maximally_mixed_qubit() {
+        // Tracing out either qubit of a Bell state must give I/2 on the
+        // remaining qubit -- the textbook example of a reduced state that
+        // is mixed even though the full state is pure.
+        let bell = create_bell_state().unwrap();
+        let density = bell.to_density_matrix().unwrap();
+        let reduced = density.partial_trace(&[0]).unwrap();
+
+        assert_eq!(reduced.num_qubits(), 1);
+        let matrix = reduced.get_matrix();
+        assert!((matrix[0][0].real() - 0.5).abs() < 1e-9);
+        assert!((matrix[1][1].real() - 0.5).abs() < 1e-9);
+        assert!(matrix[0][1].magnitude() < 1e-9);
+        assert!(matrix[1][0].magnitude() < 1e-9);
+        assert!((reduced.trace() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_partial_trace_product_state_is_unaffected_by_spectator_qubit() {
+        // Tracing out qubit 1 from a product state |0>|0> must give back
+        // the pure state |0><0| on qubit 0, unlike the Bell state case.
+        let register = QuantumRegister::new(2).unwrap();
+        let density = register.to_density_matrix().unwrap();
+        let reduced = density.partial_trace(&[0]).unwrap();
+
+        assert!(reduced.is_pure());
+        assert!((reduced.get_matrix()[0][0].real() - 1.0).abs() < 1e-9);
+    }
+
+    // --- is_valid ---
+
+    #[test]
+    fn test_is_valid_accepts_well_formed_density_matrix() {
+        let bell = create_bell_state().unwrap();
+        let density = bell.to_density_matrix().unwrap();
+        assert!(density.is_valid().is_ok());
+
+        let reduced = density.partial_trace(&[0]).unwrap();
+        assert!(reduced.is_valid().is_ok());
+    }
+
+    #[test]
+    fn test_is_valid_rejects_non_hermitian_matrix() {
+        let mut density = DensityMatrix::new(1).unwrap();
+        // Corrupt an off-diagonal entry so matrix[0][1] != conj(matrix[1][0]).
+        density.matrix[0][1] = Complex::new(1.0, 0.0);
+        assert!(density.is_valid().is_err());
+    }
+
+    // --- validate_kraus_operators ---
+
+    #[test]
+    fn test_validate_kraus_operators_accepts_amplitude_damping_kraus_set() {
+        // The exact K0/K1 pair used by apply_amplitude_damping should
+        // satisfy the completeness relation for any valid gamma.
+        let gamma: f64 = 0.3;
+        let k0 = [
+            Complex::new(1.0, 0.0), Complex::new(0.0, 0.0),
+            Complex::new(0.0, 0.0), Complex::new((1.0 - gamma).sqrt(), 0.0),
+        ];
+        let k1 = [
+            Complex::new(0.0, 0.0), Complex::new(gamma.sqrt(), 0.0),
+            Complex::new(0.0, 0.0), Complex::new(0.0, 0.0),
+        ];
+        assert!(DensityMatrix::validate_kraus_operators(&[k0, k1]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_kraus_operators_rejects_non_unitary_single_operator() {
+        // A lone Kraus operator that isn't unitary (here, 2*I) fails the
+        // completeness relation -- Sum K^dagger K = 4*I != I.
+        let two_i = [
+            Complex::new(2.0, 0.0), Complex::new(0.0, 0.0),
+            Complex::new(0.0, 0.0), Complex::new(2.0, 0.0),
+        ];
+        assert!(DensityMatrix::validate_kraus_operators(&[two_i]).is_err());
+    }
+
+    // --- mixed-state (Uhlmann) fidelity ---
+
+    #[test]
+    fn test_mixed_fidelity_identical_states_is_one() {
+        let bell = create_bell_state().unwrap();
+        let density = bell.to_density_matrix().unwrap();
+        let fidelity = density.fidelity(&density).unwrap();
+        assert!((fidelity - 1.0).abs() < 1e-6, "expected fidelity 1.0, got {}", fidelity);
+    }
+
+    #[test]
+    fn test_mixed_fidelity_orthogonal_states_is_zero() {
+        let zero = QuantumRegister::new(1).unwrap().to_density_matrix().unwrap();
+        let mut one_reg = QuantumRegister::new(1).unwrap();
+        one_reg.apply_pauli_x(0).unwrap();
+        let one = one_reg.to_density_matrix().unwrap();
+
+        let fidelity = zero.fidelity(&one).unwrap();
+        assert!(fidelity.abs() < 1e-6, "expected fidelity 0.0, got {}", fidelity);
+    }
+
+    // --- concurrence ---
+
+    #[test]
+    fn test_concurrence_bell_state_is_one() {
+        let bell = create_bell_state().unwrap();
+        let density = bell.to_density_matrix().unwrap();
+        let concurrence = density.concurrence().unwrap();
+        assert!((concurrence - 1.0).abs() < 1e-6, "expected concurrence 1.0, got {}", concurrence);
+    }
+
+    #[test]
+    fn test_concurrence_product_state_is_zero() {
+        let register = QuantumRegister::new(2).unwrap();
+        let density = register.to_density_matrix().unwrap();
+        let concurrence = density.concurrence().unwrap();
+        assert!(concurrence.abs() < 1e-6, "expected concurrence 0.0, got {}", concurrence);
+    }
+
+    // --- negativity ---
+
+    #[test]
+    fn test_negativity_bell_state_is_half() {
+        // The negativity of a Bell state is exactly 0.5 (its partial
+        // transpose has eigenvalues {0.5, 0.5, 0.5, -0.5}).
+        let bell = create_bell_state().unwrap();
+        let density = bell.to_density_matrix().unwrap();
+        let negativity = density.negativity(&[1]).unwrap();
+        assert!((negativity - 0.5).abs() < 1e-6, "expected negativity 0.5, got {}", negativity);
+    }
+
+    #[test]
+    fn test_negativity_product_state_is_zero() {
+        let register = QuantumRegister::new(2).unwrap();
+        let density = register.to_density_matrix().unwrap();
+        let negativity = density.negativity(&[1]).unwrap();
+        assert!(negativity.abs() < 1e-6, "expected negativity 0.0, got {}", negativity);
+    }
+
+    // --- RXX / RYY / RZZ ---
+
+    #[test]
+    fn test_apply_rxx_pi_on_zero_zero_gives_minus_i_eleven() {
+        // RXX(pi)|00> = -i|11>
+        let mut register = QuantumRegister::new(2).unwrap();
+        register.apply_rxx(0, 1, PI).unwrap();
+        let state = register.get_state_vector();
+
+        assert!(state[0].magnitude() < 1e-9);
+        let expected = Complex::new(0.0, -1.0);
+        assert!((state[3] - expected).magnitude() < 1e-9, "expected -i|11>, got {}", state[3]);
+    }
+
+    #[test]
+    fn test_apply_ryy_pi_on_zero_zero_gives_i_eleven() {
+        // RYY(pi)|00> = i|11>
+        let mut register = QuantumRegister::new(2).unwrap();
+        register.apply_ryy(0, 1, PI).unwrap();
+        let state = register.get_state_vector();
+
+        assert!(state[0].magnitude() < 1e-9);
+        let expected = Complex::new(0.0, 1.0);
+        assert!((state[3] - expected).magnitude() < 1e-9, "expected i|11>, got {}", state[3]);
+    }
+
+    #[test]
+    fn test_apply_rzz_is_diagonal_and_preserves_probabilities() {
+        // RZZ is a pure phase gate: |00> picks up exp(-i*pi/2) = -i, and
+        // the probability distribution (hence physical state) must be
+        // completely unchanged.
+        let mut register = QuantumRegister::new(2).unwrap();
+        register.apply_rzz(0, 1, PI).unwrap();
+        let state = register.get_state_vector();
+
+        let expected = Complex::new(0.0, -1.0);
+        assert!((state[0] - expected).magnitude() < 1e-9, "expected -i|00>, got {}", state[0]);
+        for i in 1..4 {
+            assert!(state[i].magnitude() < 1e-9);
+        }
+    }
+
+    // --- general Pauli-string expectation value ---
+
+    #[test]
+    fn test_expectation_value_pauli_string_matches_pauli_z_single_term() {
+        let mut register = QuantumRegister::new(2).unwrap();
+        register.apply_pauli_x(0).unwrap(); // qubit 0 -> |1>
+
+        let via_z = register.expectation_value_pauli_z(0).unwrap();
+        let via_string = register
+            .expectation_value_pauli_string(&[(0, PauliOp::Z)])
+            .unwrap();
+        assert!((via_z - via_string).abs() < 1e-9);
+        assert!((via_string - (-1.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_expectation_value_pauli_string_xx_on_bell_state() {
+        // <Bell| X tensor X |Bell> = 1 for the (|00>+|11>)/sqrt2 Bell state.
+        let bell = create_bell_state().unwrap();
+        let expectation = bell
+            .expectation_value_pauli_string(&[(0, PauliOp::X), (1, PauliOp::X)])
+            .unwrap();
+        assert!((expectation - 1.0).abs() < 1e-9, "expected 1.0, got {}", expectation);
+    }
+
+    // --- W state ---
+
+    #[test]
+    fn test_create_w_state_has_equal_single_excitation_amplitudes() {
+        let w = create_w_state(3).unwrap();
+        let state = w.get_state_vector();
+        let expected_amplitude = 1.0 / (3.0f64).sqrt();
+
+        for q in 0..3 {
+            let idx = 1usize << q;
+            assert!(
+                (state[idx].real() - expected_amplitude).abs() < 1e-9,
+                "amplitude at single-excitation state {} should be {}, got {}",
+                idx, expected_amplitude, state[idx]
+            );
+            assert!(state[idx].imag().abs() < 1e-9);
+        }
+
+        // |000> and |111> (and any other multi/zero-excitation state)
+        // must have zero amplitude.
+        assert!(state[0].magnitude() < 1e-9);
+        assert!(state[7].magnitude() < 1e-9);
+
+        let total_probability: f64 = state.iter().map(|c| c.magnitude_squared()).sum();
+        assert!((total_probability - 1.0).abs() < 1e-9);
     }
 }
