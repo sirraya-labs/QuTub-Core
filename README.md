@@ -48,6 +48,8 @@ Most from-scratch simulators stop at "it runs a circuit." Sirraya QuTub is built
 **Tooling**
 - A command-line interface for reservoir training, prediction, and benchmarking.
 - A benchmark suite reporting gate-chain and QFT throughput across qubit counts.
+- `QuantumCircuit`, a chainable circuit builder that accumulates every construction error across a whole chain (surfaced via `.build()`) instead of stopping at, or silently dropping, the first one.
+- Reproducible measurement via `QuantumRegister::new_with_seed`, for regression tests and reproducible benchmark figures.
 
 ---
 
@@ -183,6 +185,44 @@ fn main() -> Result<(), String> {
 }
 ```
 
+### Building a circuit without losing errors
+
+```rust
+use sirraya_qutub::quantum_simulator::{QuantumCircuit, QuantumRegister};
+
+fn main() -> Result<(), String> {
+    let mut circuit = QuantumCircuit::new(2)?;
+    circuit
+        .hadamard(0)
+        .cnot(0, 1)
+        .rz(1, 0.4);
+
+    // Every gate call's success or failure is tracked as the chain runs.
+    // build() reports every problem in the chain at once, not just the
+    // first — useful when a circuit is assembled from a loop or a
+    // generated gate list rather than typed out by hand.
+    if let Err(errors) = circuit.build() {
+        for e in errors {
+            eprintln!("circuit error: {e}");
+        }
+    }
+
+    // Reproducible measurement: two seeded registers driven through the
+    // same gates always collapse identically.
+    let mut a = QuantumRegister::new_with_seed(2, 42)?;
+    a.apply_hadamard(0)?;
+    let outcome_a = a.measure_single_qubit(0)?;
+
+    let mut b = QuantumRegister::new_with_seed(2, 42)?;
+    b.apply_hadamard(0)?;
+    let outcome_b = b.measure_single_qubit(0)?;
+
+    assert_eq!(outcome_a, outcome_b);
+
+    Ok(())
+}
+```
+
 ### Validating noise against real hardware
 
 ```rust
@@ -280,7 +320,7 @@ State-vector gate-chain and QFT throughput, measured on this crate's benchmark s
 
 Run the benchmark suite directly with `sirraya-qutub benchmark <qubits>`, or via `QuantumBenchmark::run_comprehensive_benchmark()`.
 
-Density-matrix operations that require a full eigendecomposition (`von_neumann_entropy` above 2 qubits, mixed-state `fidelity`, `concurrence`, and `negativity`) use a classical Jacobi eigensolver on the equivalent real symmetric matrix. This is numerically simple and robust at the qubit counts this crate targets, but scales as roughly `O(n⁴)` in the density-matrix dimension — see [Limitations](#limitations).
+Density-matrix operations that require a full eigendecomposition (`von_neumann_entropy` above 2 qubits, mixed-state `fidelity`, `concurrence`, and `negativity`) use a cyclic Jacobi eigensolver (Golub & Van Loan, *Matrix Computations*, §8.4) on the equivalent real symmetric matrix: every off-diagonal pair is rotated once per sweep in fixed order, rather than searching for the single largest off-diagonal entry before each rotation. That drops the cost from `O(n⁴)` (search-based classical Jacobi) to `O(n³)` per the standard sweep-count/quadratic-convergence argument for cyclic Jacobi — see [Limitations](#limitations) for where the remaining cost still bites.
 
 ---
 
@@ -293,29 +333,32 @@ cargo test
 The suite includes correctness checks against known closed-form results:
 - Bell-state, GHZ-state, and W-state distributions and amplitudes.
 - Purity, trace, and Hermiticity preservation under every noise channel.
-- Von Neumann entropy against analytically known values (including the maximally mixed state).
+- Von Neumann entropy against analytically known values (including the maximally mixed state, and a 4-qubit GHZ state's reduced entropy via `partial_trace`, exercising the eigensolver at a larger matrix size).
 - Gate-matrix regression tests distinguishing RX from RY by their complex phase, and RXX/RYY/RZZ against their known action on basis states.
 - Trace distance and mixed-state fidelity, including invariance under global phase.
 - Concurrence and negativity on both maximally entangled and product states.
 - Kraus-operator completeness validation, including the exact operators used by `apply_amplitude_damping`.
+- Seeded-measurement reproducibility (`new_with_seed`), and that unseeded registers still measure correctly.
+- `QuantumCircuit` builder error accumulation: a chain with several invalid calls reports every one of them, not just the first, and valid calls elsewhere in the same chain still apply.
 - QFT round-trip identity.
 
 ---
 
 ## Limitations
 
-- Maximum register size is 16 qubits (2¹⁶-dimensional state vector), configurable via `MAX_QUBITS` in `complex`.
-- Density-matrix simulation is dense; memory scales as `O(4ⁿ)` for an `n`-qubit system regardless of circuit sparsity.
-- `von_neumann_entropy`, mixed-state `fidelity`, and `concurrence` for systems larger than a couple of qubits diagonalize the full density matrix via an internal Jacobi eigensolver rather than a specialized sparse or iterative method (e.g. Lanczos); this becomes computationally expensive past roughly 10 qubits.
-- `partial_trace` and `negativity` are `O(d²)` in the density-matrix dimension (i.e. `O(4ⁿ)` in qubit count), which is fine at the qubit counts this crate targets but is not intended for large registers.
+These are structural to the current dense, from-scratch architecture, not oversights — overcoming them means a different representation (sparse states, tensor networks, or a stabilizer fast path for Clifford circuits), not a bug fix:
+
+- Maximum register size is 16 qubits (2¹⁶-dimensional state vector), configurable via `MAX_QUBITS` in `complex`. Raising it doesn't change the underlying constraint — dense state-vector and density-matrix memory grows exponentially regardless of the cap.
+- Density-matrix simulation is dense; memory scales as `O(4ⁿ)` for an `n`-qubit system regardless of circuit sparsity, so `partial_trace` and `negativity` — both `O(d²)` in the density-matrix dimension — inherit that `O(4ⁿ)` qubit-count scaling.
+- `von_neumann_entropy`, mixed-state `fidelity`, and `concurrence` for systems larger than a couple of qubits diagonalize the full density matrix via the cyclic Jacobi eigensolver (see [Performance](#performance)) rather than a specialized sparse or iterative method (e.g. Lanczos, which trades exactness for only computing the extremal eigenvalues a caller actually needs). Cyclic Jacobi's `O(n³)` is a real improvement over the `O(n⁴)` the crate started with, but it still computes the *full* spectrum, so this remains the practical ceiling for large registers.
 - `concurrence` is currently defined only for two-qubit density matrices, matching Wootters' original formulation; `negativity` supports arbitrary bipartitions of larger systems.
-- Measurement outcomes use `rand::thread_rng()` and are not currently seedable, so individual runs are not reproducible bit-for-bit (though statistical properties are, of course, reproducible in aggregate).
+- The seeded RNG (`new_with_seed`) reseeds a fresh `StdRng` per draw from `(seed, call index)` rather than advancing one continuous RNG stream. This keeps `QuantumRegister` itself free of any RNG state to carry (so it stays trivially `Clone`), and is fine for reproducible tests and benchmark figures, but it is not a cryptographic-quality or statistically-independent-stream guarantee — don't reach for it if you need a rigorously validated PRNG stream for, say, a Monte Carlo error-bar study.
 
 ## Roadmap
 
-- Seeded RNG option for reproducible measurement outcomes.
-- `QuantumCircuit` builder methods currently swallow per-gate errors (`&mut Self` chaining rather than `Result` propagation); a parallel fallible builder API is planned rather than a breaking change to the existing one.
-- Sparse or iterative eigensolvers (e.g. Lanczos) to extend entropy/fidelity/concurrence computation past the current qubit-count ceiling.
+- Sparse or iterative eigensolvers (e.g. Lanczos) to extend entropy/fidelity/concurrence computation past the current qubit-count ceiling by computing only the eigenvalues a given call actually needs, rather than the full spectrum.
+- A stabilizer-formalism fast path for Clifford-only circuits (H, S, CNOT, Pauli, measurement), which would sidestep the dense `O(4ⁿ)` ceiling entirely for the (large) class of circuits that don't need universal gates — at the cost of not supporting arbitrary rotations in that mode.
+- Extending `concurrence` (or an equivalent computable entanglement measure) to systems larger than two qubits, where it's known to not generalize directly and requires a different quantity entirely (e.g. entanglement of formation is NP-hard to compute in general).
 
 ---
 

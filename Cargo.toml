@@ -1,6 +1,6 @@
 [package]
 name = "sirraya-qutub"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["Sirraya Labs"]
 description = "A quantum state-vector and density-matrix simulator in Rust, with a quantum reservoir computing module."

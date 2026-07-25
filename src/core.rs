@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::time::{Duration, Instant};
 use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 /// A single-qubit Pauli operator, used to specify sparse Pauli-string
 /// observables for `QuantumRegister::expectation_value_pauli_string`.
@@ -586,6 +588,23 @@ impl DensityMatrix {
     /// Givens rotation until the matrix is (numerically) diagonal, then
     /// returns the diagonal (the eigenvalues). O(n^3) per sweep; a handful
     /// of sweeps is enough to converge for the small matrices used here.
+    /// Eigendecomposition of a real symmetric matrix via cyclic Jacobi
+    /// rotations (Golub & Van Loan, *Matrix Computations*, Sec. 8.4).
+    ///
+    /// This sweeps through every off-diagonal pair `(p, q)` in fixed
+    /// order and zeroes each one in turn, rather than searching for the
+    /// single largest off-diagonal entry before every rotation (the
+    /// "classical" Jacobi variant). That distinction matters
+    /// asymptotically: classical Jacobi pays an O(n^2) search before each
+    /// O(n) rotation update, and needs O(n^2) rotations to converge, for
+    /// O(n^4) total. Cyclic Jacobi does a fixed O(n^2) rotations per
+    /// sweep (no search) at O(n) each -- O(n^3) per sweep -- and, once
+    /// past the first couple of sweeps, converges quadratically (each
+    /// sweep roughly squares the off-diagonal residual), so a small
+    /// constant number of sweeps suffices regardless of n. Net effect:
+    /// O(n^3) instead of O(n^4), which is what actually determines
+    /// whether `von_neumann_entropy`, `fidelity`, and `concurrence` stay
+    /// usable as qubit count grows.
     fn jacobi_eigen(a: &mut [Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
         let n = a.len();
         if n == 0 {
@@ -600,59 +619,57 @@ impl DensityMatrix {
         }
 
         // Scale-relative convergence threshold: EPSILON alone is far too
-        // tight for larger matrices (each of the ~n^2/2 off-diagonal
-        // rotations carries its own floating-point error, and this
-        // algorithm eliminates only the single largest off-diagonal entry
-        // per iteration rather than a full sweep, so it needs many more
-        // iterations to converge as n grows). Since Jacobi rotations are
-        // orthogonal similarity transforms, the trace is exactly preserved
-        // at every step regardless of convergence -- so an under-iterated
-        // matrix doesn't show up as "slightly off", it shows up as some
-        // diagonal entries wildly too large offset by others wildly too
-        // negative (still summing to the right trace), which then blows
-        // up the entropy sum. Both a generous iteration cap and a
-        // frobenius-norm-relative threshold are needed to avoid that.
+        // tight for larger matrices, since it doesn't account for the
+        // accumulated floating-point error of O(n^2) rotations.
         let frobenius_norm: f64 = a.iter().flatten().map(|v| v * v).sum::<f64>().sqrt();
         let threshold = (frobenius_norm * 1e-12).max(1e-14);
-        let max_iterations = 200 * n * n + 500;
 
-        for _iter in 0..max_iterations {
-            // Find largest off-diagonal magnitude
-            let mut off_diag_sum = 0.0;
-            let (mut p, mut q, mut max_val) = (0usize, 1usize, 0.0f64);
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    let v = a[i][j].abs();
-                    off_diag_sum += v * v;
-                    if v > max_val {
-                        max_val = v;
-                        p = i;
-                        q = j;
-                    }
-                }
-            }
+        // Quadratic convergence means this is a generous cap, not a
+        // typical iteration count -- most matrices at the sizes this
+        // simulator targets converge in well under 20 sweeps.
+        let max_sweeps = 100;
 
+        for _sweep in 0..max_sweeps {
+            // Off-diagonal Frobenius norm at the start of this sweep
+            // (i.e. the end state of the previous one). Checked before
+            // doing any rotations so a converged matrix exits in O(n^2)
+            // rather than paying for another full sweep.
+            let off_diag_sum: f64 = (0..n)
+                .flat_map(|i| ((i + 1)..n).map(move |j| (i, j)))
+                .map(|(i, j)| a[i][j] * a[i][j])
+                .sum();
             if off_diag_sum.sqrt() < threshold {
                 break;
             }
 
-            let (c, s) = if a[p][p] == a[q][q] {
-                // 45 degree rotation when diagonal entries are equal
-                (std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2 * a[p][q].signum())
-            } else {
-                let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
-                let t = theta.signum() / (theta.abs() + (1.0 + theta * theta).sqrt());
-                let c = 1.0 / (1.0 + t * t).sqrt();
-                (c, t * c)
-            };
-            Self::apply_jacobi_rotation(a, p, q, c, s);
+            for p in 0..n {
+                for q in (p + 1)..n {
+                    // Already zero (or effectively so): rotating would be
+                    // wasted work, and if a[p][p] == a[q][q] too this also
+                    // sidesteps a 0/0 in the theta computation below.
+                    if a[p][q].abs() < 1e-300 {
+                        continue;
+                    }
 
-            // Accumulate the same rotation into V's columns p, q.
-            for i in 0..n {
-                let vip = v[i][p];
-                let viq = v[i][q];
-                v[i][p] = c * vip - s * viq;
-                v[i][q] = s * vip + c * viq;
+                    let (c, s) = if a[p][p] == a[q][q] {
+                        // 45 degree rotation when diagonal entries are equal
+                        (std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2 * a[p][q].signum())
+                    } else {
+                        let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                        let t = theta.signum() / (theta.abs() + (1.0 + theta * theta).sqrt());
+                        let c = 1.0 / (1.0 + t * t).sqrt();
+                        (c, t * c)
+                    };
+                    Self::apply_jacobi_rotation(a, p, q, c, s);
+
+                    // Accumulate the same rotation into V's columns p, q.
+                    for i in 0..n {
+                        let vip = v[i][p];
+                        let viq = v[i][q];
+                        v[i][p] = c * vip - s * viq;
+                        v[i][q] = s * vip + c * viq;
+                    }
+                }
             }
         }
 
@@ -924,6 +941,13 @@ pub struct QuantumRegister {
     state_vector: Vec<Complex>,
     num_qubits: usize,
     dimension: usize,
+    /// If set, measurement outcomes are drawn from a deterministic
+    /// sequence keyed on this seed instead of the system RNG.
+    seed: Option<u64>,
+    /// Number of random draws made so far under `seed`, used to advance
+    /// the deterministic sequence without storing any RNG state on the
+    /// struct itself (keeping `QuantumRegister` trivially `Clone`/`Debug`).
+    rng_calls: u64,
 }
 
 impl QuantumRegister {
@@ -943,7 +967,40 @@ impl QuantumRegister {
             state_vector,
             num_qubits,
             dimension,
+            seed: None,
+            rng_calls: 0,
         })
+    }
+
+    /// Construct a register whose measurement outcomes are reproducible:
+    /// two registers built with `new_with_seed(n, seed)` and driven
+    /// through the same sequence of gates and measurements will always
+    /// collapse identically. Without a seed (the plain `new()`
+    /// constructor), measurement draws from the system RNG and is not
+    /// reproducible run-to-run -- which matters for regression tests and
+    /// reproducible benchmark figures, but not for physical realism.
+    pub fn new_with_seed(num_qubits: usize, seed: u64) -> Result<Self, String> {
+        let mut register = Self::new(num_qubits)?;
+        register.seed = Some(seed);
+        Ok(register)
+    }
+
+    /// Draw the next uniform random value in [0, 1). If this register was
+    /// constructed with a seed, the value comes from a fresh `StdRng`
+    /// re-seeded from `(seed, call index)` -- deterministic and
+    /// reproducible, at the cost of not being a single continuously
+    /// advanced RNG stream (a design tradeoff made so `QuantumRegister`
+    /// itself never has to store RNG state). Otherwise, falls back to
+    /// the system RNG as before.
+    fn next_random_unit(&mut self) -> f64 {
+        match self.seed {
+            Some(seed) => {
+                let mut rng = StdRng::seed_from_u64(seed.wrapping_add(self.rng_calls));
+                self.rng_calls = self.rng_calls.wrapping_add(1);
+                rng.gen()
+            }
+            None => rand::thread_rng().gen(),
+        }
     }
 
     pub fn num_qubits(&self) -> usize {
@@ -1439,8 +1496,7 @@ impl QuantumRegister {
             }
         }
 
-        let mut rng = rand::thread_rng();
-        let random_val: f64 = rng.gen();
+        let random_val: f64 = self.next_random_unit();
         let result = if random_val < prob_zero { 0 } else { 1 };
 
         self.collapse_after_single_measurement(qubit, result);
@@ -1459,8 +1515,7 @@ impl QuantumRegister {
             }
         }
 
-        let mut rng = rand::thread_rng();
-        let random_val: f64 = rng.gen();
+        let random_val: f64 = self.next_random_unit();
         let result = if random_val < prob_zero { 0 } else { 1 };
         let probability = if result == 0 { prob_zero } else { 1.0 - prob_zero };
 
@@ -1504,8 +1559,7 @@ impl QuantumRegister {
     }
 
     pub fn measure_all_qubits(&mut self) -> Result<Vec<u8>, String> {
-        let mut rng = rand::thread_rng();
-        let random_val: f64 = rng.gen();
+        let random_val: f64 = self.next_random_unit();
 
         let mut cumulative_prob = 0.0;
         let mut result_state = 0;
@@ -1537,8 +1591,7 @@ impl QuantumRegister {
     }
 
     pub fn measure_all_qubits_with_probability(&mut self) -> Result<(Vec<u8>, f64), String> {
-        let mut rng = rand::thread_rng();
-        let random_val: f64 = rng.gen();
+        let random_val: f64 = self.next_random_unit();
 
         let mut cumulative_prob = 0.0;
         let mut result_state = 0;
@@ -1757,9 +1810,24 @@ impl QuantumRegister {
         qasm
     }
 }
+/// A chainable circuit builder over a `QuantumRegister`.
+///
+/// Every gate method keeps the original ergonomic `&mut Self` chaining
+/// signature (`circuit.hadamard(0).cnot(0, 1).rz(1, 0.3)`), but instead
+/// of silently dropping a failed call (e.g. an out-of-range qubit index),
+/// each failure is recorded internally. Call [`QuantumCircuit::build`]
+/// after the chain to check whether anything went wrong -- and if so,
+/// you get every error from the whole chain at once, not just the
+/// first one. This "fail-slow" shape is deliberately different from a
+/// `?`-per-call chain: when a circuit is built programmatically (e.g.
+/// from a loop over generated gate indices), stopping at the first bad
+/// index means fixing and re-running one error at a time, whereas
+/// accumulating them surfaces every problem in the batch in a single
+/// pass.
 pub struct QuantumCircuit {
     register: QuantumRegister,
     operations: Vec<String>,
+    errors: Vec<String>,
 }
 
 impl QuantumCircuit {
@@ -1767,130 +1835,151 @@ impl QuantumCircuit {
         Ok(Self {
             register: QuantumRegister::new(num_qubits)?,
             operations: Vec::new(),
+            errors: Vec::new(),
         })
     }
 
-    pub fn hadamard(&mut self, target: usize) -> &mut Self {
-        if self.register.apply_hadamard(target).is_ok() {
-            self.operations.push(format!("h q[{}];", target));
+    /// Records the outcome of a single builder call: on success, logs
+    /// the operation's QASM-style string; on failure, accumulates the
+    /// error (tagged with the attempted operation) instead of dropping
+    /// it. Shared by every gate method below to keep them one-line.
+    fn record(&mut self, result: Result<(), String>, op: String) -> &mut Self {
+        match result {
+            Ok(()) => self.operations.push(op),
+            Err(e) => self.errors.push(format!("{} (attempted: {})", e, op)),
         }
         self
+    }
+
+    pub fn hadamard(&mut self, target: usize) -> &mut Self {
+        let result = self.register.apply_hadamard(target);
+        self.record(result, format!("h q[{}];", target))
     }
 
     pub fn x(&mut self, target: usize) -> &mut Self {
-        if self.register.apply_pauli_x(target).is_ok() {
-            self.operations.push(format!("x q[{}];", target));
-        }
-        self
+        let result = self.register.apply_pauli_x(target);
+        self.record(result, format!("x q[{}];", target))
     }
 
     pub fn y(&mut self, target: usize) -> &mut Self {
-        if self.register.apply_pauli_y(target).is_ok() {
-            self.operations.push(format!("y q[{}];", target));
-        }
-        self
+        let result = self.register.apply_pauli_y(target);
+        self.record(result, format!("y q[{}];", target))
     }
 
     pub fn z(&mut self, target: usize) -> &mut Self {
-        if self.register.apply_pauli_z(target).is_ok() {
-            self.operations.push(format!("z q[{}];", target));
-        }
-        self
+        let result = self.register.apply_pauli_z(target);
+        self.record(result, format!("z q[{}];", target))
     }
 
     pub fn s(&mut self, target: usize) -> &mut Self {
-        if self.register.apply_s_gate(target).is_ok() {
-            self.operations.push(format!("s q[{}];", target));
-        }
-        self
+        let result = self.register.apply_s_gate(target);
+        self.record(result, format!("s q[{}];", target))
     }
 
     pub fn sdg(&mut self, target: usize) -> &mut Self {
-        if self.register.apply_s_dag_gate(target).is_ok() {
-            self.operations.push(format!("sdg q[{}];", target));
-        }
-        self
+        let result = self.register.apply_s_dag_gate(target);
+        self.record(result, format!("sdg q[{}];", target))
     }
 
     pub fn t(&mut self, target: usize) -> &mut Self {
-        if self.register.apply_t_gate(target).is_ok() {
-            self.operations.push(format!("t q[{}];", target));
-        }
-        self
+        let result = self.register.apply_t_gate(target);
+        self.record(result, format!("t q[{}];", target))
     }
 
     pub fn tdg(&mut self, target: usize) -> &mut Self {
-        if self.register.apply_t_dag_gate(target).is_ok() {
-            self.operations.push(format!("tdg q[{}];", target));
-        }
-        self
+        let result = self.register.apply_t_dag_gate(target);
+        self.record(result, format!("tdg q[{}];", target))
     }
 
     pub fn cnot(&mut self, control: usize, target: usize) -> &mut Self {
-        if self.register.apply_cnot(control, target).is_ok() {
-            self.operations.push(format!("cx q[{}], q[{}];", control, target));
-        }
-        self
+        let result = self.register.apply_cnot(control, target);
+        self.record(result, format!("cx q[{}], q[{}];", control, target))
     }
 
     pub fn swap(&mut self, qubit1: usize, qubit2: usize) -> &mut Self {
-        if self.register.apply_swap(qubit1, qubit2).is_ok() {
-            self.operations.push(format!("swap q[{}], q[{}];", qubit1, qubit2));
-        }
-        self
+        let result = self.register.apply_swap(qubit1, qubit2);
+        self.record(result, format!("swap q[{}], q[{}];", qubit1, qubit2))
     }
 
     pub fn cswap(&mut self, control: usize, target1: usize, target2: usize) -> &mut Self {
-        if self.register.apply_cswap(control, target1, target2).is_ok() {
-            self.operations.push(format!("cswap q[{}], q[{}], q[{}];", control, target1, target2));
-        }
-        self
+        let result = self.register.apply_cswap(control, target1, target2);
+        self.record(result, format!("cswap q[{}], q[{}], q[{}];", control, target1, target2))
     }
 
     pub fn toffoli(&mut self, control1: usize, control2: usize, target: usize) -> &mut Self {
-        if self.register.apply_toffoli(control1, control2, target).is_ok() {
-            self.operations.push(format!("ccx q[{}], q[{}], q[{}];", control1, control2, target));
-        }
-        self
+        let result = self.register.apply_toffoli(control1, control2, target);
+        self.record(result, format!("ccx q[{}], q[{}], q[{}];", control1, control2, target))
     }
 
     pub fn rx(&mut self, target: usize, angle: f64) -> &mut Self {
-        if self.register.apply_rx(target, angle).is_ok() {
-            self.operations.push(format!("rx({}) q[{}];", angle, target));
-        }
-        self
+        let result = self.register.apply_rx(target, angle);
+        self.record(result, format!("rx({}) q[{}];", angle, target))
     }
 
     pub fn ry(&mut self, target: usize, angle: f64) -> &mut Self {
-        if self.register.apply_ry(target, angle).is_ok() {
-            self.operations.push(format!("ry({}) q[{}];", angle, target));
-        }
-        self
+        let result = self.register.apply_ry(target, angle);
+        self.record(result, format!("ry({}) q[{}];", angle, target))
     }
 
     pub fn rz(&mut self, target: usize, angle: f64) -> &mut Self {
-        if self.register.apply_rz(target, angle).is_ok() {
-            self.operations.push(format!("rz({}) q[{}];", angle, target));
-        }
-        self
+        let result = self.register.apply_rz(target, angle);
+        self.record(result, format!("rz({}) q[{}];", angle, target))
+    }
+
+    pub fn rxx(&mut self, qubit_a: usize, qubit_b: usize, angle: f64) -> &mut Self {
+        let result = self.register.apply_rxx(qubit_a, qubit_b, angle);
+        self.record(result, format!("rxx({}) q[{}], q[{}];", angle, qubit_a, qubit_b))
+    }
+
+    pub fn ryy(&mut self, qubit_a: usize, qubit_b: usize, angle: f64) -> &mut Self {
+        let result = self.register.apply_ryy(qubit_a, qubit_b, angle);
+        self.record(result, format!("ryy({}) q[{}], q[{}];", angle, qubit_a, qubit_b))
+    }
+
+    pub fn rzz(&mut self, qubit_a: usize, qubit_b: usize, angle: f64) -> &mut Self {
+        let result = self.register.apply_rzz(qubit_a, qubit_b, angle);
+        self.record(result, format!("rzz({}) q[{}], q[{}];", angle, qubit_a, qubit_b))
     }
 
     pub fn controlled_phase(&mut self, control: usize, target: usize, angle: f64) -> &mut Self {
-        if self.register.apply_controlled_phase(control, target, angle).is_ok() {
-            self.operations.push(format!("cp({}) q[{}], q[{}];", angle, control, target));
-        }
-        self
+        let result = self.register.apply_controlled_phase(control, target, angle);
+        self.record(result, format!("cp({}) q[{}], q[{}];", angle, control, target))
     }
 
     pub fn multi_controlled_x(&mut self, controls: &[usize], target: usize) -> &mut Self {
-        if self.register.apply_multi_controlled_x(controls, target).is_ok() {
-            let controls_str = controls.iter()
-                .map(|c| format!("q[{}]", c))
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.operations.push(format!("mcx {}, q[{}];", controls_str, target));
+        let result = self.register.apply_multi_controlled_x(controls, target);
+        let controls_str = controls.iter()
+            .map(|c| format!("q[{}]", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.record(result, format!("mcx {}, q[{}];", controls_str, target))
+    }
+
+    /// Checks whether every gate call made on this circuit so far
+    /// succeeded. Returns `Ok(())` if so, or `Err` with every
+    /// accumulated error message (one per failed call, in the order
+    /// they occurred) if not. Call this after building up a circuit
+    /// through the chainable gate methods to find out whether anything
+    /// silently failed -- e.g. `circuit.h(0).cnot(0, 5).build()?` on a
+    /// 2-qubit register reports the out-of-range CNOT rather than
+    /// dropping it.
+    pub fn build(&self) -> Result<(), Vec<String>> {
+        if self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(self.errors.clone())
         }
-        self
+    }
+
+    /// True if any gate call on this circuit has failed so far.
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    /// Every accumulated error message, in the order the failing calls
+    /// occurred. Does not clear the error log.
+    pub fn errors(&self) -> &[String] {
+        &self.errors
     }
 
     pub fn measure_single(&mut self, qubit: usize) -> Result<u8, String> {
@@ -2647,5 +2736,102 @@ mod tests {
 
         let total_probability: f64 = state.iter().map(|c| c.magnitude_squared()).sum();
         assert!((total_probability - 1.0).abs() < 1e-9);
+    }
+
+    // --- seeded RNG reproducibility ---
+
+    #[test]
+    fn test_seeded_measurement_is_reproducible() {
+        // Two registers built from the same seed, driven through the
+        // same gates and measurements, must collapse identically.
+        let mut a = QuantumRegister::new_with_seed(2, 42).unwrap();
+        a.apply_hadamard(0).unwrap();
+        a.apply_hadamard(1).unwrap();
+        let results_a = a.measure_all_qubits().unwrap();
+
+        let mut b = QuantumRegister::new_with_seed(2, 42).unwrap();
+        b.apply_hadamard(0).unwrap();
+        b.apply_hadamard(1).unwrap();
+        let results_b = b.measure_all_qubits().unwrap();
+
+        assert_eq!(results_a, results_b);
+    }
+
+    #[test]
+    fn test_unseeded_measurement_still_works() {
+        // The default constructor must still measure without panicking
+        // and produce a valid, normalized post-measurement state.
+        let mut register = QuantumRegister::new(2).unwrap();
+        register.apply_hadamard(0).unwrap();
+        let result = register.measure_single_qubit(0);
+        assert!(result.is_ok());
+    }
+
+    // --- cyclic Jacobi correctness at a size too large for the old
+    //     search-based classical Jacobi to keep the same guarantees ---
+
+    #[test]
+    fn test_von_neumann_entropy_ghz_4qubit_partial_trace_matches_maximally_mixed() {
+        // Tracing any proper subset of qubits out of an n-qubit GHZ state
+        // leaves that subset maximally mixed -- a real reduced-state
+        // entropy computed via partial_trace, exercising the cyclic
+        // Jacobi solver at a larger (16x16 doubled-block) matrix than the
+        // 2-qubit tests above reach.
+        let ghz = create_ghz_state(4).unwrap();
+        let density = ghz.to_density_matrix().unwrap();
+        let reduced = density.partial_trace(&[0]).unwrap();
+
+        let entropy = reduced.von_neumann_entropy();
+        assert!(
+            (entropy - 1.0).abs() < 1e-6,
+            "expected 1 bit of entropy (maximally mixed single qubit), got {}", entropy
+        );
+    }
+
+    // --- fail-slow QuantumCircuit builder ---
+
+    #[test]
+    fn test_quantum_circuit_build_ok_when_every_gate_succeeds() {
+        let mut circuit = QuantumCircuit::new(2).unwrap();
+        circuit.hadamard(0).cnot(0, 1);
+        assert!(!circuit.has_errors());
+        assert!(circuit.build().is_ok());
+    }
+
+    #[test]
+    fn test_quantum_circuit_accumulates_every_error_in_the_chain() {
+        let mut circuit = QuantumCircuit::new(2).unwrap();
+        // Three deliberately invalid calls chained together: an
+        // out-of-range single-qubit gate, an out-of-range CNOT target,
+        // and a second out-of-range gate. All three must be reported --
+        // not just the first one a `?`-per-call chain would have stopped at.
+        circuit
+            .hadamard(5)
+            .cnot(0, 7)
+            .x(9);
+
+        assert!(circuit.has_errors());
+        let errors = circuit.errors();
+        assert_eq!(errors.len(), 3, "expected all 3 failed calls to be recorded, got {:?}", errors);
+
+        match circuit.build() {
+            Err(errs) => assert_eq!(errs.len(), 3),
+            Ok(()) => panic!("build() should report the accumulated errors"),
+        }
+    }
+
+    #[test]
+    fn test_quantum_circuit_valid_gates_still_apply_after_an_earlier_error() {
+        // A failed call must not derail the rest of the chain -- the
+        // register should still reflect every gate that *did* succeed.
+        let mut circuit = QuantumCircuit::new(2).unwrap();
+        circuit.hadamard(5).cnot(0, 1); // first call invalid, second valid
+        assert_eq!(circuit.errors().len(), 1);
+        assert_eq!(circuit.get_operations().len(), 1);
+
+        let distribution = circuit.get_register().get_probability_distribution();
+        // Only the CNOT applied (control=0 in |0>, so it's a no-op on
+        // |00>), so the register should still read |00> with certainty.
+        assert!((distribution.get("00").unwrap_or(&0.0) - 1.0).abs() < 1e-9);
     }
 }
