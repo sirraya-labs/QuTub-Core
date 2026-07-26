@@ -3,7 +3,7 @@
 //! A minimal, dependency-free complex number type (rather than pulling in
 //! `num-complex`) sized for exactly what this crate needs: amplitude and
 //! matrix-entry arithmetic for state vectors and density matrices up to
-//! [`MAX_QUBITS`] qubits.
+//! `MAX_QUBITS` qubits.
 //!
 //! # Example
 //!
