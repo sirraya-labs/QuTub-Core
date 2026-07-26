@@ -1,6 +1,6 @@
 [package]
 name = "sirraya-qutub"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Sirraya Labs"]
@@ -25,6 +25,7 @@ doctest = true
 [[bin]]
 name = "sirraya-qutub"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 rand = "0.8"
