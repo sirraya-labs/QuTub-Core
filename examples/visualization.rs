@@ -1,268 +1,570 @@
-//! Generates visualization data for the sirraya-qutub documentation.
+//! Sirraya QuTub — Experimental Visualization Dataset Generator
 //!
-//! Run:
-//!     cargo run --example visualization
+//! Generates CSV datasets for:
 //!
-//! Outputs CSV files in `data/` ready for plotting with the companion
-//! `scripts/plot.py` script. Top labs use Python for final figures —
-//! we follow that convention: compute in Rust, plot in Python.
+//! 1. State-vector scaling
+//! 2. QFT scaling
+//! 3. Ideal-vs-perturbed circuit fidelity as depth increases
+//! 4. GHZ entanglement structure
+//! 5. W-state structure
+//! 6. Density-matrix noise / purity / entropy
+//! 7. Bell-state probability distribution
+//!
+//! These experiments are separate from the correctness-validation suite.
+//!
+//! The validation suite asks:
+//!     "Does QuTub implement the expected mathematics?"
+//!
+//! This example asks:
+//!     "How does QuTub behave as the problem size, circuit depth,
+//!      or noise strength changes?"
 
 use sirraya_qutub::{
-    create_bell_state, create_ghz_state, create_w_state, QuantumBenchmark, QuantumRegister,
+    create_bell_state,
+    create_ghz_state,
+    create_w_state,
+    quantum_fourier_transform,
+    DensityMatrix,
+    QuantumRegister,
 };
-use std::fs::{self, File};
-use std::io::Write;
-use std::time::{Duration, Instant};
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
+use std::fs;
+use std::time::Instant;
 
-const QUBIT_COUNTS: &[usize] = &[2, 4, 6, 8, 10, 12, 14, 16];
-const BENCHMARK_ITERATIONS: usize = 10;
-const DEPOLARIZING_PROBABILITIES: &[f64] = &[0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0];
-const GATE_DEPTHS: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128];
+/// QuTub currently rejects registers larger than 16 qubits.
+///
+/// Keep this synchronized with the current public implementation.
+const MAX_SUPPORTED_QUBITS: usize = 16;
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
+/// Maximum number of qubits used for the QFT experiment.
+///
+/// QFT becomes increasingly expensive because it contains O(n²) controlled
+/// phase operations, each operating over a 2^n state vector.
+const MAX_QFT_QUBITS: usize = 16;
 
-fn main() {
-    println!("sirraya-qutub visualization data generation\n");
+/// Directory containing generated CSV datasets.
+const OUTPUT_DIR: &str = "validation_output";
 
-    benchmark_scaling().expect("benchmark_scaling failed");
-    fidelity_vs_depth().expect("fidelity_vs_depth failed");
-    entanglement_scaling().expect("entanglement_scaling failed");
-    noise_channel_curves().expect("noise_channel_curves failed");
+// ============================================================================
+// Utility
+// ============================================================================
 
-    println!("Done. Data files saved to data/");
-    println!("Run: python scripts/plot.py");
+fn ensure_output_directory() -> Result<(), String> {
+    fs::create_dir_all(OUTPUT_DIR)
+        .map_err(|e| format!("failed to create {OUTPUT_DIR}: {e}"))
 }
 
-// ---------------------------------------------------------------------------
-// 1. Runtime scaling benchmark
-// ---------------------------------------------------------------------------
+// ============================================================================
+// 1. STATE-VECTOR SCALING
+// ============================================================================
 
-/// Measures wall-clock time for Hadamard chain, CNOT chain, QFT, and
-/// Bell-state preparation across qubit counts from 2 up to 16.
+/// Measures the cost of constructing a state vector and applying one
+/// Hadamard layer across all qubits.
 ///
-/// Output: `data/scaling.csv`
-fn benchmark_scaling() -> std::io::Result<()> {
-    fs::create_dir_all("data")?;
-    let mut f = File::create("data/scaling.csv")?;
-    writeln!(f, "qubits,dimension,hadamard_us,cnot_us,qft_us,bell_us")?;
-
-    for &num_qubits in QUBIT_COUNTS {
-        let dimension = 1usize << num_qubits;
-
-        let h_time = QuantumBenchmark::benchmark_hadamard_chain(num_qubits, BENCHMARK_ITERATIONS);
-        let cnot_time = QuantumBenchmark::benchmark_cnot_chain(num_qubits, BENCHMARK_ITERATIONS);
-        let qft_time = QuantumBenchmark::benchmark_qft(num_qubits, BENCHMARK_ITERATIONS);
-
-        let bell_time = {
-            let mut total = Duration::new(0, 0);
-            let num_pairs = num_qubits / 2;
-            for _ in 0..BENCHMARK_ITERATIONS {
-                let start = Instant::now();
-                for _ in 0..num_pairs {
-                    let _ = create_bell_state();
-                }
-                total += start.elapsed();
-            }
-            total / BENCHMARK_ITERATIONS as u32
-        };
-
-        let hadamard_us = h_time.as_micros() as f64;
-        let cnot_us = cnot_time.as_micros() as f64;
-        let qft_us = qft_time.as_micros() as f64;
-        let bell_us = bell_time.as_micros() as f64;
-
-        writeln!(
-            f,
-            "{num_qubits},{dimension},{hadamard_us},{cnot_us},{qft_us},{bell_us}"
-        )?;
-
-        println!(
-            "  {num_qubits:>2} qubits (dim={dimension:>6}): \
-             H={hadamard_us:>10.1} µs, CNOT={cnot_us:>10.1} µs, \
-             QFT={qft_us:>10.1} µs, Bell={bell_us:>10.1} µs"
-        );
-    }
-
-    println!("  -> data/scaling.csv\n");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// 2. Fidelity vs gate depth
-// ---------------------------------------------------------------------------
-
-/// Applies a random circuit of increasing depth to a multi-qubit register
-/// and measures self-fidelity at each depth.
+/// State-vector dimension is:
 ///
-/// Output: `data/fidelity_vs_depth.csv`
-fn fidelity_vs_depth() -> std::io::Result<()> {
-    let mut f = File::create("data/fidelity_vs_depth.csv")?;
-    writeln!(f, "qubits,depth,fidelity")?;
+///     2^n
+///
+/// where n is the number of qubits.
+///
+/// This benchmark intentionally stops at QuTub's current maximum of
+/// 16 qubits.
+fn benchmark_state_vector_scaling() -> Result<(), String> {
+    let path = format!("{OUTPUT_DIR}/state_vector_scaling.csv");
 
-    for &num_qubits in &[4, 6, 8] {
-        for &depth in GATE_DEPTHS {
-            let mut register =
-                QuantumRegister::new_with_seed(num_qubits, 0xDEAD_BEEF)
-                    .expect("register construction failed");
+    let mut csv = String::from(
+        "qubits,state_dimension,construction_ms,hadamard_chain_ms\n",
+    );
 
-            for layer in 0..depth {
-                for qubit in 0..num_qubits {
-                    let angle = (layer as f64 * 1.7 + qubit as f64 * 2.3)
-                        % (2.0 * std::f64::consts::PI);
-                    register.apply_rx(qubit, angle).expect("RX gate failed");
-                    register.apply_rz(qubit, angle * 0.5).expect("RZ gate failed");
-                }
-                for i in 0..num_qubits - 1 {
-                    register.apply_cnot(i, i + 1).expect("CNOT gate failed");
-                }
-            }
+    for qubits in 1usize..=MAX_SUPPORTED_QUBITS {
+        let dimension = 1usize
+            .checked_shl(qubits as u32)
+            .ok_or_else(|| {
+                format!("state dimension overflow for {qubits} qubits")
+            })?;
 
-            let original = register.clone();
-            let fidelity = register.fidelity(&original).expect("fidelity failed");
+        // Construction benchmark.
+        let start = Instant::now();
 
-            writeln!(f, "{num_qubits},{depth},{fidelity:.12}")?;
-            println!("  {num_qubits} qubits, depth {depth:>3}: fidelity = {fidelity:.12}");
+        let _register = QuantumRegister::new(qubits)?;
+
+        let construction_ms =
+            start.elapsed().as_secs_f64() * 1000.0;
+
+        // Gate-layer benchmark.
+        let mut register = QuantumRegister::new(qubits)?;
+
+        let start = Instant::now();
+
+        for q in 0..qubits {
+            register.apply_hadamard(q)?;
         }
+
+        let hadamard_chain_ms =
+            start.elapsed().as_secs_f64() * 1000.0;
+
+        csv.push_str(&format!(
+            "{qubits},{dimension},{construction_ms:.9},{hadamard_chain_ms:.9}\n"
+        ));
     }
 
-    println!("  -> data/fidelity_vs_depth.csv\n");
+    fs::write(&path, csv)
+        .map_err(|e| format!("failed to write {path}: {e}"))?;
+
+    println!("wrote {path}");
+
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// 3. Entanglement metrics vs qubit count
-// ---------------------------------------------------------------------------
+// ============================================================================
+// 2. QFT SCALING
+// ============================================================================
 
-/// Computes entanglement measures (concurrence, negativity, von Neumann
-/// entropy of reduced state) for GHZ and W states across qubit counts.
+/// Measures QFT execution time as the number of qubits increases.
 ///
-/// Output: `data/entanglement.csv`
-fn entanglement_scaling() -> std::io::Result<()> {
-    let mut f = File::create("data/entanglement.csv")?;
-    writeln!(
-        f,
-        "qubits,state,concurrence,negativity,von_neumann_entropy"
-    )?;
+/// The input is deliberately non-trivial: every qubit starts in |+>.
+fn benchmark_qft_scaling() -> Result<(), String> {
+    let path = format!("{OUTPUT_DIR}/qft_scaling.csv");
 
-    for &num_qubits in &[2, 3, 4, 5, 6] {
-        // GHZ state
-        let ghz = create_ghz_state(num_qubits).expect("GHZ construction failed");
-        let ghz_density = ghz.to_density_matrix().expect("density conversion failed");
+    let mut csv = String::from(
+        "qubits,state_dimension,qft_ms\n",
+    );
 
-        // W state
-        let w = create_w_state(num_qubits).expect("W construction failed");
-        let w_density = w.to_density_matrix().expect("density conversion failed");
+    for qubits in 1usize..=MAX_QFT_QUBITS {
+        let dimension = 1usize
+            .checked_shl(qubits as u32)
+            .ok_or_else(|| {
+                format!("state dimension overflow for {qubits} qubits")
+            })?;
 
-        // Concurrence (only defined for 2-qubit systems)
-        let concurrence = if num_qubits == 2 {
-            ghz_density.concurrence().unwrap_or(-1.0)
-        } else {
-            -1.0
-        };
+        let mut register = QuantumRegister::new(qubits)?;
 
-        // Negativity across the bipartition (qubit 0 vs rest)
-        let negativity = ghz_density.negativity(&[0]).unwrap_or(-1.0);
+        // Prepare a non-trivial input state.
+        for q in 0..qubits {
+            register.apply_hadamard(q)?;
+        }
 
-        // Von Neumann entropy of reduced single-qubit state
-        let entropy_ghz = ghz_density
-            .partial_trace(&[0])
-            .map(|r| r.von_neumann_entropy())
-            .unwrap_or(-1.0);
+        let start = Instant::now();
 
-        let entropy_w = w_density
-            .partial_trace(&[0])
-            .map(|r| r.von_neumann_entropy())
-            .unwrap_or(-1.0);
+        quantum_fourier_transform(&mut register)?;
 
-        writeln!(
-            f,
-            "{num_qubits},GHZ,{concurrence:.12},{negativity:.12},{entropy_ghz:.12}"
-        )?;
-        writeln!(
-            f,
-            "{num_qubits},W,,,{entropy_w:.12}"
-        )?;
+        let qft_ms =
+            start.elapsed().as_secs_f64() * 1000.0;
 
-        println!(
-            "  {num_qubits} qubits: GHZ negativity={negativity:.6}, \
-             GHZ S_vn={entropy_ghz:.6}, W S_vn={entropy_w:.6}"
-        );
+        csv.push_str(&format!(
+            "{qubits},{dimension},{qft_ms:.9}\n"
+        ));
     }
 
-    println!("  -> data/entanglement.csv\n");
+    fs::write(&path, csv)
+        .map_err(|e| format!("failed to write {path}: {e}"))?;
+
+    println!("wrote {path}");
+
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// 4. Noise channel action
-// ---------------------------------------------------------------------------
+// ============================================================================
+// 3. FIDELITY VS CIRCUIT DEPTH
+// ============================================================================
 
-/// Applies depolarizing and amplitude-damping channels at increasing
-/// strength to a Bell state and tracks purity, fidelity, and trace.
+/// Measures the fidelity between:
 ///
-/// Output: `data/noise.csv`
-fn noise_channel_curves() -> std::io::Result<()> {
-    let mut f = File::create("data/noise.csv")?;
-    writeln!(f, "probability,channel,purity,fidelity,trace")?;
+///     ideal circuit
+///
+/// and
+///
+///     perturbed circuit
+///
+/// as circuit depth increases.
+///
+/// IMPORTANT:
+///
+/// This does NOT compare a state to itself.
+///
+/// The perturbed circuit receives a small deterministic Rz rotation after
+/// every layer. Therefore:
+///
+///     F(ideal, perturbed)
+///
+/// measures the accumulated effect of coherent gate perturbations.
+///
+/// This is a numerical sensitivity experiment, NOT a physical hardware-noise
+/// model.
+fn fidelity_vs_depth() -> Result<(), String> {
+    let path = format!("{OUTPUT_DIR}/fidelity_vs_depth.csv");
 
-    // Depolarizing channel on a Bell state
-    for &probability in DEPOLARIZING_PROBABILITIES {
-        let bell = create_bell_state().expect("Bell construction failed");
-        let bell_ref = bell.to_density_matrix().expect("density conversion failed");
-        let mut density = bell.to_density_matrix().expect("density conversion failed");
+    let mut csv = String::from(
+        "depth,ideal_vs_perturbed_fidelity,trace_distance\n",
+    );
 
-        density
-            .apply_depolarizing_channel(probability, 0)
-            .expect("depolarizing channel failed");
+    const QUBITS: usize = 3;
+    const MAX_DEPTH: usize = 50;
 
-        let purity = density.purity();
-        let fidelity = density.fidelity(&bell_ref).unwrap_or(0.0);
-        let trace = density.trace();
+    // Small deterministic coherent perturbation.
+    const PERTURBATION: f64 = 0.01;
 
-        writeln!(
-            f,
-            "{probability},depolarizing,{purity:.12},{fidelity:.12},{trace:.12}"
-        )?;
+    for depth in 1usize..=MAX_DEPTH {
+        let mut ideal = QuantumRegister::new(QUBITS)?;
+        let mut perturbed = QuantumRegister::new(QUBITS)?;
 
-        println!(
-            "  depolarizing(p={probability:.2}): purity={purity:.6}, \
-             fidelity={fidelity:.6}, trace={trace:.6}"
-        );
+        for _layer in 0..depth {
+            // ------------------------------------------------------------
+            // Ideal circuit
+            // ------------------------------------------------------------
+
+            for q in 0..QUBITS {
+                ideal.apply_hadamard(q)?;
+            }
+
+            ideal.apply_cnot(0, 1)?;
+            ideal.apply_cnot(1, 2)?;
+
+            // ------------------------------------------------------------
+            // Perturbed circuit
+            // ------------------------------------------------------------
+
+            for q in 0..QUBITS {
+                perturbed.apply_hadamard(q)?;
+            }
+
+            perturbed.apply_cnot(0, 1)?;
+            perturbed.apply_cnot(1, 2)?;
+
+            // Coherent perturbation.
+            for q in 0..QUBITS {
+                perturbed.apply_rz(q, PERTURBATION)?;
+            }
+        }
+
+        // THIS is the meaningful comparison.
+        let fidelity = ideal.fidelity(&perturbed)?;
+
+        // For the pure-state fidelity convention used by QuTub:
+        //
+        //     D = sqrt(1 - F)
+        //
+        // for pure states.
+        let trace_distance =
+            (1.0 - fidelity).max(0.0).sqrt();
+
+        csv.push_str(&format!(
+            "{depth},{fidelity:.12},{trace_distance:.12}\n"
+        ));
     }
 
-    // Amplitude damping channel on |1>
-    for &gamma in &[0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0] {
-        let mut register = QuantumRegister::new(1).expect("register construction failed");
-        register.apply_pauli_x(0).expect("X gate failed");
+    fs::write(&path, csv)
+        .map_err(|e| format!("failed to write {path}: {e}"))?;
 
-        let reference = register.to_density_matrix().expect("density conversion failed");
-        let mut density = reference.clone();
+    println!("wrote {path}");
 
-        density
-            .apply_amplitude_damping(gamma, 0)
-            .expect("amplitude damping failed");
+    Ok(())
+}
 
-        let purity = density.purity();
-        let fidelity = density.fidelity(&reference).unwrap_or(0.0);
-        let trace = density.trace();
+// ============================================================================
+// 4. GHZ ENTANGLEMENT STRUCTURE
+// ============================================================================
 
-        writeln!(
-            f,
-            "{gamma},amplitude_damping,{purity:.12},{fidelity:.12},{trace:.12}"
-        )?;
+/// Generates the probability of:
+///
+///     |00...0>
+///
+///     |11...1>
+///
+/// and all forbidden basis states.
+///
+/// For an ideal n-qubit GHZ state:
+///
+///     |GHZ_n> = (|00...0> + |11...1>) / sqrt(2)
+///
+/// therefore:
+///
+///     P(00...0) = 1/2
+///     P(11...1) = 1/2
+///     P(forbidden) = 0
+fn ghz_entanglement_data() -> Result<(), String> {
+    let path = format!("{OUTPUT_DIR}/ghz_entanglement.csv");
 
-        println!(
-            "  amplitude damping(γ={gamma:.2}): purity={purity:.6}, \
-             fidelity={fidelity:.6}, trace={trace:.6}"
-        );
+    let mut csv = String::from(
+        "qubits,p_all_zero,p_all_ones,forbidden_probability\n",
+    );
+
+    for qubits in 2usize..=MAX_SUPPORTED_QUBITS {
+        let ghz = create_ghz_state(qubits)?;
+
+        let distribution =
+            ghz.get_probability_distribution();
+
+        let zero_state = "0".repeat(qubits);
+        let one_state = "1".repeat(qubits);
+
+        let p_zero = distribution
+            .get(&zero_state)
+            .copied()
+            .unwrap_or(0.0);
+
+        let p_one = distribution
+            .get(&one_state)
+            .copied()
+            .unwrap_or(0.0);
+
+        let forbidden_probability =
+            (1.0 - p_zero - p_one).max(0.0);
+
+        csv.push_str(&format!(
+            "{qubits},{p_zero:.12},{p_one:.12},{forbidden_probability:.12}\n"
+        ));
     }
 
-    println!("  -> data/noise.csv\n");
+    fs::write(&path, csv)
+        .map_err(|e| format!("failed to write {path}: {e}"))?;
+
+    println!("wrote {path}");
+
+    Ok(())
+}
+
+// ============================================================================
+// 5. W-STATE STRUCTURE
+// ============================================================================
+
+/// Checks that an n-qubit W state contains equal probability in every
+/// single-excitation basis state.
+///
+/// For:
+///
+///     |W_n> = 1/sqrt(n) * sum_i |0...010...0>
+///
+/// every single-excitation state should have probability:
+///
+///     1/n
+fn w_state_data() -> Result<(), String> {
+    let path = format!("{OUTPUT_DIR}/w_state.csv");
+
+    let mut csv = String::from(
+        "qubits,expected_single_excitation_probability,max_error,total_probability\n",
+    );
+
+    for qubits in 2usize..=MAX_SUPPORTED_QUBITS {
+        let w = create_w_state(qubits)?;
+
+        let distribution =
+            w.get_probability_distribution();
+
+        let expected =
+            1.0 / qubits as f64;
+
+        let mut max_error: f64 = 0.0;
+
+        for q in 0..qubits {
+            let index = 1usize << q;
+
+            // Convert basis index to a fixed-width binary string because
+            // QuTub's probability-distribution API uses String keys.
+            let state =
+                format!("{index:0width$b}", width = qubits);
+
+            let probability = distribution
+                .get(&state)
+                .copied()
+                .unwrap_or(0.0);
+
+            let error =
+                (probability - expected).abs();
+
+            max_error =
+                max_error.max(error);
+        }
+
+        let total_probability: f64 =
+            distribution.values().sum();
+
+        csv.push_str(&format!(
+            "{qubits},{expected:.12},{max_error:.12},{total_probability:.12}\n"
+        ));
+    }
+
+    fs::write(&path, csv)
+        .map_err(|e| format!("failed to write {path}: {e}"))?;
+
+    println!("wrote {path}");
+
+    Ok(())
+}
+
+// ============================================================================
+// 6. DENSITY MATRIX / DEPOLARIZING NOISE
+// ============================================================================
+
+/// Applies increasing depolarizing noise to a Bell state and records:
+///
+///     purity
+///     von Neumann entropy
+///
+/// This is a genuine mixed-state experiment.
+///
+/// At zero noise the Bell-state density matrix is pure.
+///
+/// Increasing noise should reduce purity and increase entropy.
+fn noise_vs_purity() -> Result<(), String> {
+    let path = format!("{OUTPUT_DIR}/noise_vs_purity.csv");
+
+    let mut csv = String::from(
+        "noise_probability,purity,von_neumann_entropy\n",
+    );
+
+    for step in 0usize..=20 {
+        let probability =
+            step as f64 / 20.0;
+
+        let bell = create_bell_state()?;
+
+        let mut density =
+            DensityMatrix::from_state_vector(
+                bell.get_state_vector(),
+            )?;
+
+        // Apply the same noise strength to both qubits.
+        density.apply_depolarizing_channel(
+            probability,
+            0,
+        )?;
+
+        density.apply_depolarizing_channel(
+            probability,
+            1,
+        )?;
+
+        let purity =
+            density.purity();
+
+        let entropy =
+            density.von_neumann_entropy();
+
+        csv.push_str(&format!(
+            "{probability:.6},{purity:.12},{entropy:.12}\n"
+        ));
+    }
+
+    fs::write(&path, csv)
+        .map_err(|e| format!("failed to write {path}: {e}"))?;
+
+    println!("wrote {path}");
+
+    Ok(())
+}
+
+// ============================================================================
+// 7. BELL STATE DISTRIBUTION
+// ============================================================================
+
+/// Writes the exact probability distribution of the Bell state.
+///
+/// Expected:
+///
+///     00 -> 0.5
+///     11 -> 0.5
+///
+/// and:
+///
+///     01 -> 0
+///     10 -> 0
+fn bell_distribution_data() -> Result<(), String> {
+    let path =
+        format!("{OUTPUT_DIR}/bell_distribution.csv");
+
+    let bell =
+        create_bell_state()?;
+
+    let distribution =
+        bell.get_probability_distribution();
+
+    let mut csv =
+        String::from("basis_state,probability\n");
+
+    // Sort the basis states so the CSV is deterministic.
+    let mut entries: Vec<_> =
+        distribution.iter().collect();
+
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (state, probability) in entries {
+        csv.push_str(&format!(
+            "{state},{probability:.12}\n"
+        ));
+    }
+
+    fs::write(&path, csv)
+        .map_err(|e| format!("failed to write {path}: {e}"))?;
+
+    println!("wrote {path}");
+
+    Ok(())
+}
+
+// ============================================================================
+// 8. SUMMARY
+// ============================================================================
+
+fn print_summary() {
+    println!();
+    println!("=== Dataset generation complete ===");
+    println!();
+    println!("Output directory:");
+    println!("  {OUTPUT_DIR}");
+    println!();
+    println!("Generated datasets:");
+    println!("  1. state_vector_scaling.csv");
+    println!("  2. qft_scaling.csv");
+    println!("  3. fidelity_vs_depth.csv");
+    println!("  4. ghz_entanglement.csv");
+    println!("  5. w_state.csv");
+    println!("  6. noise_vs_purity.csv");
+    println!("  7. bell_distribution.csv");
+    println!();
+    println!(
+        "Maximum supported state-vector size: {MAX_SUPPORTED_QUBITS} qubits"
+    );
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+fn main() -> Result<(), String> {
+    println!(
+        "=== Sirraya QuTub experimental dataset generator ==="
+    );
+    println!();
+    println!(
+        "Configured maximum: {MAX_SUPPORTED_QUBITS} qubits"
+    );
+    println!();
+
+    ensure_output_directory()?;
+
+    println!("Generating state-vector scaling...");
+    benchmark_state_vector_scaling()?;
+
+    println!("Generating QFT scaling...");
+    benchmark_qft_scaling()?;
+
+    println!("Generating fidelity-vs-depth experiment...");
+    fidelity_vs_depth()?;
+
+    println!("Generating GHZ entanglement data...");
+    ghz_entanglement_data()?;
+
+    println!("Generating W-state data...");
+    w_state_data()?;
+
+    println!("Generating density-matrix noise data...");
+    noise_vs_purity()?;
+
+    println!("Generating Bell-state distribution...");
+    bell_distribution_data()?;
+
+    print_summary();
+
     Ok(())
 }
