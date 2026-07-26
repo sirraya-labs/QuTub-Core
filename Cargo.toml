@@ -1,6 +1,6 @@
 [package]
 name = "sirraya-qutub"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Sirraya Labs"]
@@ -30,17 +30,13 @@ path = "src/main.rs"
 rand = "0.8"
 
 [dev-dependencies]
-# Add criterion here if/when QuantumBenchmark's hand-rolled timing loops
-# move to proper `cargo bench` targets under benches/ -- see notes below.
-# criterion = "0.5"
 
 [profile.release]
 opt-level = 3
 lto = true
-codegen-units = 1  # trades slower release builds for a tighter, faster binary; pairs with lto = true
+codegen-units = 1
 
-# Ensures docs.rs renders the same output you'd get locally with
-# `cargo doc --all-features --open`.
+# docs.rs configuration
 [package.metadata.docs.rs]
 all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
+rustdoc-args = ["--cfg", "docsrs", "-Z", "unstable-options", "--disable-per-crate-search"]
