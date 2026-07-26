@@ -1,20 +1,46 @@
 [package]
 name = "sirraya-qutub"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
+rust-version = "1.75"
 authors = ["Sirraya Labs"]
 description = "A quantum state-vector and density-matrix simulator in Rust, with a quantum reservoir computing module."
 license = "MIT"
 repository = "https://github.com/sirraya-labs/QuTub-Core"
 homepage = "https://github.com/sirraya-labs/QuTub-Core"
+documentation = "https://docs.rs/sirraya-qutub"
 readme = "README.md"
 keywords = ["quantum", "simulation", "reservoir-computing", "physics"]
 categories = ["science", "simulation"]
-rust-version = "1.75"
+
+# Explicit lib + bin targets. Cargo would auto-detect both src/lib.rs and
+# src/main.rs even without this, but spelling it out documents intent now
+# that the crate is a real library (used by main.rs itself, and by anyone
+# depending on `sirraya-qutub` from crates.io) rather than a bare binary.
+[lib]
+name = "sirraya_qutub"
+path = "src/lib.rs"
+doctest = true
+
+[[bin]]
+name = "sirraya-qutub"
+path = "src/main.rs"
 
 [dependencies]
 rand = "0.8"
 
+[dev-dependencies]
+# Add criterion here if/when QuantumBenchmark's hand-rolled timing loops
+# move to proper `cargo bench` targets under benches/ -- see notes below.
+# criterion = "0.5"
+
 [profile.release]
 opt-level = 3
 lto = true
+codegen-units = 1  # trades slower release builds for a tighter, faster binary; pairs with lto = true
+
+# Ensures docs.rs renders the same output you'd get locally with
+# `cargo doc --all-features --open`.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

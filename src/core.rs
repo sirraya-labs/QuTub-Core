@@ -31,6 +31,11 @@ pub struct DensityMatrix {
 }
 
 impl DensityMatrix {
+    /// Constructs the maximally-mixed-at-zero initial state |0...0><0...0|
+    /// (a pure state, trace 1) for `num_qubits` qubits.
+    ///
+    /// # Errors
+    /// Returns `Err` if `num_qubits` is 0 or exceeds `MAX_QUBITS`.
     pub fn new(num_qubits: usize) -> Result<Self, String> {
         if num_qubits == 0 {
             return Err("Number of qubits must be at least 1".to_string());
@@ -50,6 +55,14 @@ impl DensityMatrix {
         })
     }
 
+    /// Builds the density matrix `rho = |psi><psi|` for a pure state given
+    /// by its state vector, i.e. the outer product of the vector with its
+    /// own conjugate. Use this to bring a `QuantumRegister`'s state vector
+    /// into density-matrix form for noise simulation or entanglement
+    /// measures (see also `QuantumRegister::to_density_matrix`).
+    ///
+    /// # Errors
+    /// Returns `Err` if `state_vector.len()` is not a power of two.
     pub fn from_state_vector(state_vector: &[Complex]) -> Result<Self, String> {
         let dimension = state_vector.len();
         if dimension.count_ones() != 1 {
@@ -72,18 +85,29 @@ impl DensityMatrix {
         })
     }
 
+    /// Number of qubits this density matrix represents.
     pub fn num_qubits(&self) -> usize {
         self.num_qubits
     }
 
+    /// Hilbert space dimension, `2^num_qubits`.
     pub fn dimension(&self) -> usize {
         self.dimension
     }
 
+    /// Read-only access to the underlying `dimension x dimension` matrix,
+    /// row-major (`matrix[row][col]`).
     pub fn get_matrix(&self) -> &[Vec<Complex>] {
         &self.matrix
     }
 
+    /// Applies an arbitrary dense unitary conjugation `rho -> U rho U^dagger`,
+    /// where `unitary` is a `dimension x dimension` matrix given row-major.
+    /// General but O(d^4); prefer `apply_unitary_embedded` for gates acting
+    /// on a small number of qubits, which take an O(d^2) fast path.
+    ///
+    /// # Errors
+    /// Returns `Err` if `unitary.len() != dimension * dimension`.
     pub fn apply_unitary(&mut self, unitary: &[Complex]) -> Result<(), String> {
         if unitary.len() != self.dimension * self.dimension {
             return Err("Unitary matrix dimension mismatch".to_string());
@@ -116,6 +140,17 @@ impl DensityMatrix {
         }
     }
 
+    /// Applies a single-qubit depolarizing channel to `qubit`: with
+    /// probability `probability` the qubit's state is replaced by the
+    /// maximally mixed state (equivalently, an X, Y, or Z error is applied
+    /// each with probability `probability / 3`), and with probability
+    /// `1 - probability` nothing happens. This is the standard noise model
+    /// for a single faulty gate (Nielsen & Chuang, Sec. 8.3.4) and is what
+    /// `xeb::run_xeb_demo` uses to simulate hardware-calibrated gate errors.
+    ///
+    /// # Errors
+    /// Returns `Err` if `probability` is not in `[0, 1]` or `qubit` is out
+    /// of range.
     pub fn apply_depolarizing_channel(&mut self, probability: f64, qubit: usize) -> Result<(), String> {
         if probability < 0.0 || probability > 1.0 {
             return Err("Probability must be between 0 and 1".to_string());
@@ -150,6 +185,14 @@ impl DensityMatrix {
         Ok(())
     }
 
+    /// Applies a single-qubit amplitude damping channel to `qubit` with
+    /// damping parameter `gamma`: models energy relaxation (e.g. spontaneous
+    /// T1 decay from |1> to |0>) via the Kraus pair
+    /// `K0 = [[1,0],[0,sqrt(1-gamma)]]`, `K1 = [[0,sqrt(gamma)],[0,0]]`
+    /// (Nielsen & Chuang, Sec. 8.3.5).
+    ///
+    /// # Errors
+    /// Returns `Err` if `gamma` is not in `[0, 1]` or `qubit` is out of range.
     pub fn apply_amplitude_damping(&mut self, gamma: f64, qubit: usize) -> Result<(), String> {
         if gamma < 0.0 || gamma > 1.0 {
             return Err("Gamma must be between 0 and 1".to_string());
@@ -390,6 +433,9 @@ impl DensityMatrix {
         Ok(())
     }
 
+    /// Trace of the density matrix, `Tr(rho) = sum_i rho[i][i]`. Should be
+    /// 1.0 (within floating-point error) for any physically valid state;
+    /// see `is_valid` for a full validity check.
     pub fn trace(&self) -> f64 {
         let mut trace = 0.0;
         for i in 0..self.dimension {
@@ -398,6 +444,9 @@ impl DensityMatrix {
         trace
     }
 
+    /// Purity `Tr(rho^2)`, ranging from `1/dimension` (maximally mixed) to
+    /// 1.0 (a pure state). Equivalent to, but cheaper than, checking
+    /// `is_pure` via eigenvalues.
     pub fn purity(&self) -> f64 {
         let mut purity = 0.0;
         for i in 0..self.dimension {
@@ -408,10 +457,17 @@ impl DensityMatrix {
         purity
     }
 
+    /// `true` if this density matrix represents a pure state, i.e. its
+    /// purity is 1.0 within numerical tolerance.
     pub fn is_pure(&self) -> bool {
         (self.purity() - 1.0).abs() < EPSILON
     }
 
+    /// Von Neumann entropy `S(rho) = -Tr(rho log2 rho)`, computed from the
+    /// eigenvalues of `rho` as `-sum_i lambda_i log2(lambda_i)` (Nielsen &
+    /// Chuang, Sec. 11.3). Zero for a pure state, maximal (`log2(dimension)`)
+    /// for the fully mixed state. Combine with `partial_trace` to get the
+    /// entanglement entropy of a subsystem.
     pub fn von_neumann_entropy(&self) -> f64 {
         // For 2x2 density matrices, use analytical formula
         if self.dimension == 2 {
@@ -915,6 +971,10 @@ impl DensityMatrix {
         Ok(eigenvalues.iter().filter(|&&l| l < 0.0).map(|l| l.abs()).sum())
     }
 
+    /// Pretty-prints a summary of this density matrix (purity, trace,
+    /// purity flag) plus up to its top-left 4x4 block of entries, to stdout.
+    /// For diagnostics/demos only; parse `get_matrix()` for anything
+    /// programmatic.
     pub fn print_density_matrix(&self) {
         println!("Density Matrix ({} qubits):", self.num_qubits);
         println!("Purity: {:.6}, Trace: {:.6}, Pure: {}", self.purity(), self.trace(), self.is_pure());
@@ -951,6 +1011,13 @@ pub struct QuantumRegister {
 }
 
 impl QuantumRegister {
+    /// Constructs the ground state |0...0> for a register of `num_qubits`
+    /// qubits, with a non-deterministic (system) RNG used for future
+    /// measurements. Use `new_with_seed` instead for reproducible
+    /// measurement outcomes.
+    ///
+    /// # Errors
+    /// Returns `Err` if `num_qubits` is 0 or exceeds `MAX_QUBITS`.
     pub fn new(num_qubits: usize) -> Result<Self, String> {
         if num_qubits == 0 {
             return Err("Number of qubits must be at least 1".to_string());
@@ -1003,10 +1070,12 @@ impl QuantumRegister {
         }
     }
 
+    /// Number of qubits in this register.
     pub fn num_qubits(&self) -> usize {
         self.num_qubits
     }
 
+    /// Hilbert space dimension, `2^num_qubits`.
     pub fn dimension(&self) -> usize {
         self.dimension
     }
@@ -1048,6 +1117,15 @@ impl QuantumRegister {
         s
     }
 
+    /// Generic single-qubit gate application: `gate_fn` receives the pair of
+    /// amplitudes `(|...0_target...>, |...1_target...>)` for every basis
+    /// state that differs only in `target`'s bit, and returns the updated
+    /// pair. All of the concrete single-qubit gates below (`apply_hadamard`,
+    /// `apply_pauli_x`, `apply_rx`, ...) are implemented in terms of this.
+    ///
+    /// # Errors
+    /// Returns `Err` if `target` is out of range, or if `gate_fn` produces a
+    /// non-finite or NaN amplitude.
     pub fn apply_single_qubit_gate<F>(&mut self, target: usize, gate_fn: F) -> Result<(), String>
     where 
         F: Fn(Complex, Complex) -> (Complex, Complex),
@@ -1072,6 +1150,8 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Applies the Hadamard gate `H = 1/sqrt(2) * [[1,1],[1,-1]]` to
+    /// `target`, creating an equal superposition from a basis state.
     pub fn apply_hadamard(&mut self, target: usize) -> Result<(), String> {
         let factor = 1.0 / 2.0_f64.sqrt();
         self.apply_single_qubit_gate(target, |left, right| {
@@ -1082,10 +1162,13 @@ impl QuantumRegister {
         })
     }
 
+    /// Applies the Pauli-X (bit-flip / NOT) gate `X = [[0,1],[1,0]]` to
+    /// `target`.
     pub fn apply_pauli_x(&mut self, target: usize) -> Result<(), String> {
         self.apply_single_qubit_gate(target, |left, right| (right, left))
     }
 
+    /// Applies the Pauli-Y gate `Y = [[0,-i],[i,0]]` to `target`.
     pub fn apply_pauli_y(&mut self, target: usize) -> Result<(), String> {
         self.apply_single_qubit_gate(target, |left, right| {
             (
@@ -1095,32 +1178,45 @@ impl QuantumRegister {
         })
     }
 
+    /// Applies the Pauli-Z (phase-flip) gate `Z = [[1,0],[0,-1]]` to
+    /// `target`.
     pub fn apply_pauli_z(&mut self, target: usize) -> Result<(), String> {
         self.apply_single_qubit_gate(target, |left, right| (left, right.scale(-1.0)))
     }
 
+    /// Applies the S (phase) gate, `diag(1, i)` -- a quarter-turn Z rotation.
     pub fn apply_s_gate(&mut self, target: usize) -> Result<(), String> {
         self.apply_phase(target, Complex::i())
     }
 
+    /// Applies S-dagger, `diag(1, -i)`, the inverse of `apply_s_gate`.
     pub fn apply_s_dag_gate(&mut self, target: usize) -> Result<(), String> {
         self.apply_phase(target, -Complex::i())
     }
 
+    /// Applies the T gate, `diag(1, e^{i*pi/4})` -- an eighth-turn Z
+    /// rotation, standard in the Clifford+T universal gate set.
     pub fn apply_t_gate(&mut self, target: usize) -> Result<(), String> {
         let phase = (Complex::i() * PI / 4.0).exp();
         self.apply_phase(target, phase)
     }
 
+    /// Applies T-dagger, `diag(1, e^{-i*pi/4})`, the inverse of
+    /// `apply_t_gate`.
     pub fn apply_t_dag_gate(&mut self, target: usize) -> Result<(), String> {
         let phase = (-Complex::i() * PI / 4.0).exp();
         self.apply_phase(target, phase)
     }
 
+    /// Applies an arbitrary relative phase gate `diag(1, phase)` to
+    /// `target`. `apply_s_gate`, `apply_t_gate` and their daggers are all
+    /// special cases of this with `phase` fixed to a root of unity.
     pub fn apply_phase(&mut self, target: usize, phase: Complex) -> Result<(), String> {
         self.apply_single_qubit_gate(target, |left, right| (left, right * phase))
     }
 
+    /// Applies the X-axis rotation `RX(angle) = [[cos(a/2), -i sin(a/2)],
+    /// [-i sin(a/2), cos(a/2)]]` to `target`, where `a = angle`.
     pub fn apply_rx(&mut self, target: usize, angle: f64) -> Result<(), String> {
         let cos = (angle / 2.0).cos();
         let sin = (angle / 2.0).sin();
@@ -1135,6 +1231,9 @@ impl QuantumRegister {
         })
     }
 
+    /// Applies the Y-axis rotation `RY(angle) = [[cos(a/2), -sin(a/2)],
+    /// [sin(a/2), cos(a/2)]]` to `target`, where `a = angle`. Unlike RX/RZ,
+    /// every matrix entry is real.
     pub fn apply_ry(&mut self, target: usize, angle: f64) -> Result<(), String> {
         let cos = (angle / 2.0).cos();
         let sin = (angle / 2.0).sin();
@@ -1146,6 +1245,8 @@ impl QuantumRegister {
         })
     }
 
+    /// Applies the Z-axis rotation `RZ(angle) = diag(e^{-i*a/2}, e^{i*a/2})`
+    /// to `target`, where `a = angle`.
     pub fn apply_rz(&mut self, target: usize, angle: f64) -> Result<(), String> {
         let phase1 = Complex::new(0.0, -angle / 2.0).exp();
         let phase2 = Complex::new(0.0, angle / 2.0).exp();
@@ -1261,6 +1362,12 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Applies CNOT (controlled-X): flips `target` iff `control` is |1>.
+    /// Implemented as an in-place swap of the paired amplitudes rather than
+    /// a full matrix multiply.
+    ///
+    /// # Errors
+    /// Returns `Err` if either index is out of range or `control == target`.
     pub fn apply_cnot(&mut self, control: usize, target: usize) -> Result<(), String> {
         self.validate_qubit_index(control)?;
         self.validate_qubit_index(target)?;
@@ -1286,6 +1393,11 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Applies controlled-Z: flips the sign of the amplitude iff both
+    /// `control` and `target` are |1>. Symmetric in its two arguments.
+    ///
+    /// # Errors
+    /// Returns `Err` if either index is out of range or `control == target`.
     pub fn apply_controlled_z(&mut self, control: usize, target: usize) -> Result<(), String> {
         self.validate_qubit_index(control)?;
         self.validate_qubit_index(target)?;
@@ -1305,6 +1417,12 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Applies a controlled phase gate: multiplies the amplitude by
+    /// `e^{i*angle}` iff both `control` and `target` are |1>. The building
+    /// block used by `quantum_fourier_transform`.
+    ///
+    /// # Errors
+    /// Returns `Err` if either index is out of range or `control == target`.
     pub fn apply_controlled_phase(&mut self, control: usize, target: usize, angle: f64) -> Result<(), String> {
         self.validate_qubit_index(control)?;
         self.validate_qubit_index(target)?;
@@ -1325,6 +1443,11 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Swaps the states of `qubit1` and `qubit2` via the standard
+    /// three-CNOT decomposition. A no-op if `qubit1 == qubit2`.
+    ///
+    /// # Errors
+    /// Returns `Err` if either index is out of range.
     pub fn apply_swap(&mut self, qubit1: usize, qubit2: usize) -> Result<(), String> {
         self.validate_qubit_index(qubit1)?;
         self.validate_qubit_index(qubit2)?;
@@ -1339,6 +1462,12 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Applies the Fredkin (controlled-SWAP) gate: swaps `target1` and
+    /// `target2` iff `control` is |1>.
+    ///
+    /// # Errors
+    /// Returns `Err` if the three qubits are not all distinct, or any index
+    /// is out of range.
     pub fn apply_cswap(&mut self, control: usize, target1: usize, target2: usize) -> Result<(), String> {
         self.validate_qubit_index(control)?;
         self.validate_qubit_index(target1)?;
@@ -1366,6 +1495,12 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Applies the Toffoli (CCNOT / doubly-controlled-X) gate: flips
+    /// `target` iff both `control1` and `control2` are |1>.
+    ///
+    /// # Errors
+    /// Returns `Err` if the three qubits are not all distinct, or any index
+    /// is out of range.
     pub fn apply_toffoli(&mut self, control1: usize, control2: usize, target: usize) -> Result<(), String> {
         self.validate_qubit_index(control1)?;
         self.validate_qubit_index(control2)?;
@@ -1390,6 +1525,13 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Applies a generalized multi-controlled-X gate: flips `target` iff
+    /// every qubit in `controls` is |1>. `apply_toffoli` is the two-control
+    /// special case of this.
+    ///
+    /// # Errors
+    /// Returns `Err` if `target` also appears in `controls`, `controls`
+    /// contains duplicates, or any index is out of range.
     pub fn apply_multi_controlled_x(&mut self, controls: &[usize], target: usize) -> Result<(), String> {
         self.validate_qubit_indices(controls)?;
         self.validate_qubit_index(target)?;
@@ -1414,6 +1556,13 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Applies a generalized multi-controlled-Z gate: flips the sign of the
+    /// amplitude iff every qubit in `controls`, plus `target`, is |1>. Used
+    /// as the diffusion-operator phase flip in `QuantumAlgorithm::grover_iteration`.
+    ///
+    /// # Errors
+    /// Returns `Err` if `target` also appears in `controls`, `controls`
+    /// contains duplicates, or any index is out of range.
     pub fn apply_multi_controlled_z(&mut self, controls: &[usize], target: usize) -> Result<(), String> {
         self.validate_qubit_indices(controls)?;
         self.validate_qubit_index(target)?;
@@ -1435,6 +1584,14 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Applies an arbitrary dense unitary (row-major, `2^k x 2^k` for
+    /// `k = targets.len()`) embedded on `targets`. The general escape hatch
+    /// for gates with no dedicated method above.
+    ///
+    /// # Errors
+    /// Returns `Err` if `matrix`'s dimensions don't match `targets.len()`,
+    /// any index is out of range, or the result contains a non-finite or
+    /// NaN amplitude.
     pub fn apply_unitary_matrix(&mut self, targets: &[usize], matrix: &[Complex]) -> Result<(), String> {
         self.validate_qubit_indices(targets)?;
         
@@ -1484,6 +1641,14 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Performs a projective measurement of `qubit` in the computational
+    /// basis: samples an outcome according to the Born rule, then collapses
+    /// and renormalizes the state vector consistently with that outcome.
+    /// This mutates the register -- use `get_measurement_probability` first
+    /// if you only need the probabilities without collapsing.
+    ///
+    /// # Errors
+    /// Returns `Err` if `qubit` is out of range.
     pub fn measure_single_qubit(&mut self, qubit: usize) -> Result<u8, String> {
         self.validate_qubit_index(qubit)?;
 
@@ -1503,6 +1668,11 @@ impl QuantumRegister {
         Ok(result)
     }
 
+    /// As `measure_single_qubit`, but also returns the probability of the
+    /// outcome that was actually sampled.
+    ///
+    /// # Errors
+    /// Returns `Err` if `qubit` is out of range.
     pub fn measure_single_qubit_with_probability(&mut self, qubit: usize) -> Result<(u8, f64), String> {
         self.validate_qubit_index(qubit)?;
 
@@ -1558,6 +1728,10 @@ impl QuantumRegister {
         }
     }
 
+    /// Performs a projective measurement of every qubit simultaneously in
+    /// the computational basis, collapsing the register to a single basis
+    /// state. Returns the outcome as MSB-first bits (index 0 is the highest
+    /// qubit index).
     pub fn measure_all_qubits(&mut self) -> Result<Vec<u8>, String> {
         let random_val: f64 = self.next_random_unit();
 
@@ -1590,6 +1764,8 @@ impl QuantumRegister {
         Ok(result_bits)
     }
 
+    /// As `measure_all_qubits`, but also returns the probability of the
+    /// sampled outcome.
     pub fn measure_all_qubits_with_probability(&mut self) -> Result<(Vec<u8>, f64), String> {
         let random_val: f64 = self.next_random_unit();
 
@@ -1624,6 +1800,12 @@ impl QuantumRegister {
         Ok((result_bits, result_probability))
     }
 
+    /// Probability of finding this register in basis state `state` (a
+    /// bitstring, MSB-first) if measured, without collapsing it: `|<state|psi>|^2`.
+    ///
+    /// # Errors
+    /// Returns `Err` if `state`'s length doesn't match `num_qubits`, or it
+    /// contains characters other than `'0'`/`'1'`.
     pub fn get_state_probability(&self, state: &str) -> Result<f64, String> {
         if state.len() != self.num_qubits {
             return Err(format!("State string length must match number of qubits {}", self.num_qubits));
@@ -1645,6 +1827,12 @@ impl QuantumRegister {
         Ok(self.state_vector[index].magnitude_squared())
     }
 
+    /// Rescales the state vector so total probability sums to 1. Not needed
+    /// in normal use (every gate preserves normalization), but useful after
+    /// manual state-vector manipulation.
+    ///
+    /// # Errors
+    /// Returns `Err` if the state vector is (numerically) all-zero.
     pub fn normalize(&mut self) -> Result<(), String> {
         let total_probability: f64 = self.state_vector.iter()
             .map(|amp| amp.magnitude_squared())
@@ -1662,10 +1850,18 @@ impl QuantumRegister {
         Ok(())
     }
 
+    /// Read-only access to the underlying state vector amplitudes, indexed
+    /// by basis state (bit `q` of the index corresponds to qubit `q`).
     pub fn get_state_vector(&self) -> &[Complex] {
         &self.state_vector
     }
 
+    /// Pure-state fidelity (squared overlap) between this register and
+    /// `other`: `F = |<psi|phi>|^2`, ranging from 0 (orthogonal) to 1
+    /// (identical up to global phase).
+    ///
+    /// # Errors
+    /// Returns `Err` if the two registers have different numbers of qubits.
     pub fn fidelity(&self, other: &Self) -> Result<f64, String> {
         if self.num_qubits != other.num_qubits {
             return Err("Quantum registers must have same number of qubits".to_string());
@@ -1679,6 +1875,13 @@ impl QuantumRegister {
         Ok(overlap.magnitude_squared())
     }
 
+    /// Trace distance between this register and `other`,
+    /// `D = sqrt(1 - F)` for pure states, where `F` is `fidelity(other)`.
+    /// Gauge-invariant: 0 for states equal up to global phase, 1 for
+    /// orthogonal states.
+    ///
+    /// # Errors
+    /// Returns `Err` if the two registers have different numbers of qubits.
     pub fn trace_distance(&self, other: &Self) -> Result<f64, String> {
         // For pure states, trace distance D(psi, phi) = sqrt(1 - |<psi|phi>|^2).
         // This is gauge-invariant (unlike a raw amplitude-difference norm), so
@@ -1687,6 +1890,12 @@ impl QuantumRegister {
         Ok((1.0 - fidelity).max(0.0).sqrt())
     }
 
+    /// Expectation value `<psi|Z_qubit|psi>` of the Pauli-Z observable on a
+    /// single qubit, ranging from +1 (|0>) to -1 (|1>). For a general
+    /// Pauli-string observable, see `expectation_value_pauli_string`.
+    ///
+    /// # Errors
+    /// Returns `Err` if `qubit` is out of range.
     pub fn expectation_value_pauli_z(&self, qubit: usize) -> Result<f64, String> {
         self.validate_qubit_index(qubit)?;
 
@@ -1739,11 +1948,17 @@ impl QuantumRegister {
         Ok(overlap.real())
     }
 
+    /// Converts this pure state into its equivalent `DensityMatrix`
+    /// representation `rho = |psi><psi|`.
     pub fn to_density_matrix(&self) -> Result<DensityMatrix, String> {
         DensityMatrix::from_state_vector(&self.state_vector)
     }
 
     // FIXED: Use the index_to_bitstring method instead of reverse_bits
+    /// Pretty-prints every basis state with non-negligible amplitude,
+    /// its probability, and a normalization warning if applicable, to
+    /// stdout. For diagnostics/demos; use `get_probability_distribution`
+    /// or `get_state_vector` for programmatic access.
     pub fn print_state(&self) {
         println!("Quantum Register State ({} qubits, dimension {}):", 
                  self.num_qubits, self.dimension);
@@ -1772,6 +1987,9 @@ impl QuantumRegister {
     }
 
     // FIXED: Use the index_to_bitstring method
+    /// Returns the full measurement probability distribution as a map from
+    /// bitstring (MSB-first) to probability, omitting basis states with
+    /// negligible (`< EPSILON`) probability.
     pub fn get_probability_distribution(&self) -> HashMap<String, f64> {
         let mut distribution = HashMap::new();
         for (i, &amplitude) in self.state_vector.iter().enumerate() {
@@ -1785,6 +2003,13 @@ impl QuantumRegister {
     }
 
     // Add a non-destructive measurement probability function
+    /// Non-destructive lookup of the `(P(0), P(1))` measurement
+    /// probabilities for `qubit`, without collapsing the state. Use this
+    /// instead of `measure_single_qubit` when you only need the
+    /// probabilities.
+    ///
+    /// # Errors
+    /// Returns `Err` if `qubit` is out of range.
     pub fn get_measurement_probability(&self, qubit: usize) -> Result<(f64, f64), String> {
         self.validate_qubit_index(qubit)?;
 
@@ -1800,6 +2025,9 @@ impl QuantumRegister {
         Ok((prob_zero, 1.0 - prob_zero))
     }
 
+    /// Emits an OpenQASM 2.0 header (`qreg`/`creg` declarations and a
+    /// comment naming the circuit) for this register. `QuantumCircuit::to_qasm`
+    /// appends the actual gate operations on top of this.
     pub fn to_qasm(&self, circuit_name: &str) -> String {
         let mut qasm = String::new();
         qasm.push_str("OPENQASM 2.0;\n");
@@ -1831,6 +2059,11 @@ pub struct QuantumCircuit {
 }
 
 impl QuantumCircuit {
+    /// Creates a new circuit builder over a fresh `num_qubits`-qubit
+    /// register in the |0...0> state.
+    ///
+    /// # Errors
+    /// Returns `Err` if `num_qubits` is 0 or exceeds `MAX_QUBITS`.
     pub fn new(num_qubits: usize) -> Result<Self, String> {
         Ok(Self {
             register: QuantumRegister::new(num_qubits)?,
@@ -1851,101 +2084,141 @@ impl QuantumCircuit {
         self
     }
 
+    /// Chainable: applies a Hadamard gate to `target`.
+    /// See [`QuantumRegister::apply_hadamard`].
     pub fn hadamard(&mut self, target: usize) -> &mut Self {
         let result = self.register.apply_hadamard(target);
         self.record(result, format!("h q[{}];", target))
     }
 
+    /// Chainable: applies a Pauli-X gate to `target`.
+    /// See [`QuantumRegister::apply_pauli_x`].
     pub fn x(&mut self, target: usize) -> &mut Self {
         let result = self.register.apply_pauli_x(target);
         self.record(result, format!("x q[{}];", target))
     }
 
+    /// Chainable: applies a Pauli-Y gate to `target`.
+    /// See [`QuantumRegister::apply_pauli_y`].
     pub fn y(&mut self, target: usize) -> &mut Self {
         let result = self.register.apply_pauli_y(target);
         self.record(result, format!("y q[{}];", target))
     }
 
+    /// Chainable: applies a Pauli-Z gate to `target`.
+    /// See [`QuantumRegister::apply_pauli_z`].
     pub fn z(&mut self, target: usize) -> &mut Self {
         let result = self.register.apply_pauli_z(target);
         self.record(result, format!("z q[{}];", target))
     }
 
+    /// Chainable: applies an S gate to `target`.
+    /// See [`QuantumRegister::apply_s_gate`].
     pub fn s(&mut self, target: usize) -> &mut Self {
         let result = self.register.apply_s_gate(target);
         self.record(result, format!("s q[{}];", target))
     }
 
+    /// Chainable: applies an S-dagger gate to `target`.
+    /// See [`QuantumRegister::apply_s_dag_gate`].
     pub fn sdg(&mut self, target: usize) -> &mut Self {
         let result = self.register.apply_s_dag_gate(target);
         self.record(result, format!("sdg q[{}];", target))
     }
 
+    /// Chainable: applies a T gate to `target`.
+    /// See [`QuantumRegister::apply_t_gate`].
     pub fn t(&mut self, target: usize) -> &mut Self {
         let result = self.register.apply_t_gate(target);
         self.record(result, format!("t q[{}];", target))
     }
 
+    /// Chainable: applies a T-dagger gate to `target`.
+    /// See [`QuantumRegister::apply_t_dag_gate`].
     pub fn tdg(&mut self, target: usize) -> &mut Self {
         let result = self.register.apply_t_dag_gate(target);
         self.record(result, format!("tdg q[{}];", target))
     }
 
+    /// Chainable: applies a CNOT gate (`control` -> `target`).
+    /// See [`QuantumRegister::apply_cnot`].
     pub fn cnot(&mut self, control: usize, target: usize) -> &mut Self {
         let result = self.register.apply_cnot(control, target);
         self.record(result, format!("cx q[{}], q[{}];", control, target))
     }
 
+    /// Chainable: swaps `qubit1` and `qubit2`.
+    /// See [`QuantumRegister::apply_swap`].
     pub fn swap(&mut self, qubit1: usize, qubit2: usize) -> &mut Self {
         let result = self.register.apply_swap(qubit1, qubit2);
         self.record(result, format!("swap q[{}], q[{}];", qubit1, qubit2))
     }
 
+    /// Chainable: applies a Fredkin (controlled-SWAP) gate.
+    /// See [`QuantumRegister::apply_cswap`].
     pub fn cswap(&mut self, control: usize, target1: usize, target2: usize) -> &mut Self {
         let result = self.register.apply_cswap(control, target1, target2);
         self.record(result, format!("cswap q[{}], q[{}], q[{}];", control, target1, target2))
     }
 
+    /// Chainable: applies a Toffoli (CCNOT) gate.
+    /// See [`QuantumRegister::apply_toffoli`].
     pub fn toffoli(&mut self, control1: usize, control2: usize, target: usize) -> &mut Self {
         let result = self.register.apply_toffoli(control1, control2, target);
         self.record(result, format!("ccx q[{}], q[{}], q[{}];", control1, control2, target))
     }
 
+    /// Chainable: applies an RX(`angle`) rotation to `target`.
+    /// See [`QuantumRegister::apply_rx`].
     pub fn rx(&mut self, target: usize, angle: f64) -> &mut Self {
         let result = self.register.apply_rx(target, angle);
         self.record(result, format!("rx({}) q[{}];", angle, target))
     }
 
+    /// Chainable: applies an RY(`angle`) rotation to `target`.
+    /// See [`QuantumRegister::apply_ry`].
     pub fn ry(&mut self, target: usize, angle: f64) -> &mut Self {
         let result = self.register.apply_ry(target, angle);
         self.record(result, format!("ry({}) q[{}];", angle, target))
     }
 
+    /// Chainable: applies an RZ(`angle`) rotation to `target`.
+    /// See [`QuantumRegister::apply_rz`].
     pub fn rz(&mut self, target: usize, angle: f64) -> &mut Self {
         let result = self.register.apply_rz(target, angle);
         self.record(result, format!("rz({}) q[{}];", angle, target))
     }
 
+    /// Chainable: applies an RXX(`angle`) Ising coupling gate.
+    /// See [`QuantumRegister::apply_rxx`].
     pub fn rxx(&mut self, qubit_a: usize, qubit_b: usize, angle: f64) -> &mut Self {
         let result = self.register.apply_rxx(qubit_a, qubit_b, angle);
         self.record(result, format!("rxx({}) q[{}], q[{}];", angle, qubit_a, qubit_b))
     }
 
+    /// Chainable: applies an RYY(`angle`) Ising coupling gate.
+    /// See [`QuantumRegister::apply_ryy`].
     pub fn ryy(&mut self, qubit_a: usize, qubit_b: usize, angle: f64) -> &mut Self {
         let result = self.register.apply_ryy(qubit_a, qubit_b, angle);
         self.record(result, format!("ryy({}) q[{}], q[{}];", angle, qubit_a, qubit_b))
     }
 
+    /// Chainable: applies an RZZ(`angle`) Ising coupling gate.
+    /// See [`QuantumRegister::apply_rzz`].
     pub fn rzz(&mut self, qubit_a: usize, qubit_b: usize, angle: f64) -> &mut Self {
         let result = self.register.apply_rzz(qubit_a, qubit_b, angle);
         self.record(result, format!("rzz({}) q[{}], q[{}];", angle, qubit_a, qubit_b))
     }
 
+    /// Chainable: applies a controlled-phase gate.
+    /// See [`QuantumRegister::apply_controlled_phase`].
     pub fn controlled_phase(&mut self, control: usize, target: usize, angle: f64) -> &mut Self {
         let result = self.register.apply_controlled_phase(control, target, angle);
         self.record(result, format!("cp({}) q[{}], q[{}];", angle, control, target))
     }
 
+    /// Chainable: applies a multi-controlled-X gate.
+    /// See [`QuantumRegister::apply_multi_controlled_x`].
     pub fn multi_controlled_x(&mut self, controls: &[usize], target: usize) -> &mut Self {
         let result = self.register.apply_multi_controlled_x(controls, target);
         let controls_str = controls.iter()
@@ -1982,30 +2255,44 @@ impl QuantumCircuit {
         &self.errors
     }
 
+    /// Measures `qubit` and returns its outcome.
+    /// See [`QuantumRegister::measure_single_qubit`].
     pub fn measure_single(&mut self, qubit: usize) -> Result<u8, String> {
         self.register.measure_single_qubit(qubit)
     }
 
+    /// Measures `qubit` and returns its outcome plus the outcome's
+    /// probability. See [`QuantumRegister::measure_single_qubit_with_probability`].
     pub fn measure_single_with_probability(&mut self, qubit: usize) -> Result<(u8, f64), String> {
         self.register.measure_single_qubit_with_probability(qubit)
     }
 
+    /// Measures every qubit and returns the outcomes.
+    /// See [`QuantumRegister::measure_all_qubits`].
     pub fn measure_all(&mut self) -> Result<Vec<u8>, String> {
         self.register.measure_all_qubits()
     }
 
+    /// Measures every qubit and returns the outcomes plus the outcome's
+    /// probability. See [`QuantumRegister::measure_all_qubits_with_probability`].
     pub fn measure_all_with_probability(&mut self) -> Result<(Vec<u8>, f64), String> {
         self.register.measure_all_qubits_with_probability()
     }
 
+    /// Read-only access to the underlying `QuantumRegister`.
     pub fn get_register(&self) -> &QuantumRegister {
         &self.register
     }
 
+    /// Mutable access to the underlying `QuantumRegister`, for operations
+    /// not exposed as chainable circuit methods.
     pub fn get_register_mut(&mut self) -> &mut QuantumRegister {
         &mut self.register
     }
 
+    /// Renders this circuit as an OpenQASM 2.0 program: register
+    /// declarations followed by every gate applied so far, in order,
+    /// plus a final `measure q -> c;`.
     pub fn to_qasm(&self, circuit_name: &str) -> String {
         let mut qasm = self.register.to_qasm(circuit_name);
         for op in &self.operations {
@@ -2016,6 +2303,8 @@ impl QuantumCircuit {
         qasm
     }
 
+    /// Pretty-prints every recorded operation (in QASM-like syntax), in
+    /// the order it was applied, to stdout.
     pub fn print_circuit(&self) {
         println!("Quantum Circuit ({} qubits):", self.register.num_qubits());
         for (i, op) in self.operations.iter().enumerate() {
@@ -2023,11 +2312,19 @@ impl QuantumCircuit {
         }
     }
 
+    /// Every recorded operation's QASM-style string, in application order.
     pub fn get_operations(&self) -> &[String] {
         &self.operations
     }
 }
 
+/// Prepares the two-qubit Bell state `(|00> + |11>) / sqrt(2)` via
+/// `H` on qubit 0 followed by `CNOT(0, 1)` -- the canonical maximally
+/// entangled two-qubit state.
+///
+/// # Errors
+/// Propagates any error from the underlying gate applications (should
+/// not occur for a freshly constructed 2-qubit register).
 pub fn create_bell_state() -> Result<QuantumRegister, String> {
     let mut register = QuantumRegister::new(2)?;
     register.apply_hadamard(0)?;
@@ -2035,6 +2332,12 @@ pub fn create_bell_state() -> Result<QuantumRegister, String> {
     Ok(register)
 }
 
+/// Prepares the `num_qubits`-qubit Greenberger-Horne-Zeilinger state
+/// `(|00...0> + |11...1>) / sqrt(2)` via a Hadamard on qubit 0 followed
+/// by a chain of CNOTs from qubit 0 to every other qubit.
+///
+/// # Errors
+/// Returns `Err` if `num_qubits` is 0 or exceeds `MAX_QUBITS`.
 pub fn create_ghz_state(num_qubits: usize) -> Result<QuantumRegister, String> {
     let mut register = QuantumRegister::new(num_qubits)?;
     register.apply_hadamard(0)?;
@@ -2066,6 +2369,13 @@ pub fn create_w_state(num_qubits: usize) -> Result<QuantumRegister, String> {
     Ok(register)
 }
 
+/// Applies the Quantum Fourier Transform in place to `register`: the
+/// standard Hadamard + controlled-phase cascade followed by a final
+/// qubit-order reversal (Nielsen & Chuang, Sec. 5.1). The core primitive
+/// behind phase estimation and Shor's algorithm.
+///
+/// # Errors
+/// Propagates any error from the underlying gate applications.
 pub fn quantum_fourier_transform(register: &mut QuantumRegister) -> Result<(), String> {
     let num_qubits = register.num_qubits();
     
@@ -2084,6 +2394,12 @@ pub fn quantum_fourier_transform(register: &mut QuantumRegister) -> Result<(), S
     Ok(())
 }
 
+/// Applies the inverse Quantum Fourier Transform in place to `register`:
+/// the exact reverse of `quantum_fourier_transform` (swap qubit order
+/// first, then undo the phase cascade with negated angles).
+///
+/// # Errors
+/// Propagates any error from the underlying gate applications.
 pub fn inverse_quantum_fourier_transform(register: &mut QuantumRegister) -> Result<(), String> {
     let num_qubits = register.num_qubits();
     
@@ -2105,6 +2421,15 @@ pub fn inverse_quantum_fourier_transform(register: &mut QuantumRegister) -> Resu
 pub struct QuantumAlgorithm {}
 
 impl QuantumAlgorithm {
+    /// Runs the Deutsch-Jozsa algorithm against `oracle`, an `n + 1`-qubit
+    /// oracle acting on `n` input qubits plus one ancilla, determining in a
+    /// single query whether `oracle`'s underlying boolean function is
+    /// constant or balanced (Deutsch & Jozsa, *Proc. R. Soc. Lond. A* 439,
+    /// 553 (1992)). Returns `true` if the function is constant.
+    ///
+    /// # Errors
+    /// Propagates any error from `oracle` or the underlying gate
+    /// applications.
     pub fn deutsch_josza(oracle: fn(&mut QuantumRegister) -> Result<(), String>, n: usize) -> Result<bool, String> {
         let mut register = QuantumRegister::new(n + 1)?;
         
@@ -2133,6 +2458,15 @@ impl QuantumAlgorithm {
         Ok(all_zero)
     }
     
+    /// Applies a single Grover iteration in place to `register`: one call
+    /// to `oracle` (the phase-flip marking the target state) followed by the
+    /// diffusion operator `H^{tensor n} (2|0><0| - I) H^{tensor n}` (Grover,
+    /// *Proc. 28th STOC* (1996)). Call this `~sqrt(2^n)` times starting from
+    /// an equal superposition to amplify the marked state's amplitude.
+    ///
+    /// # Errors
+    /// Propagates any error from `oracle` or the underlying gate
+    /// applications.
     pub fn grover_iteration(register: &mut QuantumRegister, oracle: fn(&mut QuantumRegister) -> Result<(), String>) -> Result<(), String> {
         oracle(register)?;
         
@@ -2165,6 +2499,8 @@ impl QuantumAlgorithm {
 pub struct QuantumBenchmark;
 
 impl QuantumBenchmark {
+    /// Benchmarks applying a Hadamard gate to every qubit of a fresh
+    /// `num_qubits`-qubit register, averaged over `iterations` runs.
     pub fn benchmark_hadamard_chain(num_qubits: usize, iterations: usize) -> Duration {
         let mut total_duration = Duration::new(0, 0);
         
@@ -2182,6 +2518,8 @@ impl QuantumBenchmark {
         total_duration / iterations as u32
     }
 
+    /// Benchmarks applying a linear chain of CNOTs across a fresh
+    /// `num_qubits`-qubit register, averaged over `iterations` runs.
     pub fn benchmark_cnot_chain(num_qubits: usize, iterations: usize) -> Duration {
         let mut total_duration = Duration::new(0, 0);
         
@@ -2199,6 +2537,8 @@ impl QuantumBenchmark {
         total_duration / iterations as u32
     }
 
+    /// Benchmarks a full Quantum Fourier Transform on a fresh
+    /// `num_qubits`-qubit register, averaged over `iterations` runs.
     pub fn benchmark_qft(num_qubits: usize, iterations: usize) -> Duration {
         let mut total_duration = Duration::new(0, 0);
         
@@ -2214,6 +2554,9 @@ impl QuantumBenchmark {
         total_duration / iterations as u32
     }
 
+    /// Runs and prints a standard suite of throughput benchmarks
+    /// (Hadamard chain, CNOT chain, QFT) across a fixed set of qubit counts,
+    /// for quick performance comparison across simulator changes.
     pub fn run_comprehensive_benchmark() {
         println!("Quantum Simulator Benchmark Results");
         println!("===================================");

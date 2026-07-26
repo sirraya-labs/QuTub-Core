@@ -1,15 +1,19 @@
-// quantum_simulator is a general-purpose library module: it exposes a
-// public API (e.g. von_neumann_entropy, the Deutsch-Jozsa/Grover helpers,
-// DensityMatrix constructors) that this CLI doesn't happen to call yet but
-// that downstream users of the module -- and its own #[cfg(test)] suite --
-// do. #[allow(dead_code)] suppresses the resulting "never used" noise
-// without hiding genuinely dead code inside the module itself.
-#[allow(dead_code)]
-mod quantum_simulator;
-
-use quantum_simulator::*;
-use std::f64::consts::PI;
+// This binary depends on the `sirraya_qutub` library crate defined by
+// this same package's src/lib.rs (Cargo links a package's binary target
+// to its library target automatically -- no path/version needed in
+// Cargo.toml). Everything below is imported through the crate's public
+// API surface (see lib.rs's re-exports) rather than a local `mod`
+// declaration, now that the old standalone `quantum_simulator.rs` module
+// has been removed in favor of the modular complex/core/reservoir/xeb
+// split.
+use sirraya_qutub::{
+    create_bell_state, create_ghz_state, demonstrate_quantum_reservoir_computing,
+    inverse_quantum_fourier_transform, quantum_fourier_transform, run_xeb_demo,
+    DensityMatrix, HardwareCalibration, QuantumBenchmark, QuantumCircuit, QuantumRegister,
+    QuantumReservoirComputer,
+};
 use std::env;
+use std::f64::consts::PI;
 
 fn main() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
