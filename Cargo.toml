@@ -1,6 +1,6 @@
 [package]
 name = "sirraya-qutub"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Sirraya Labs"]
@@ -21,10 +21,21 @@ categories = ["science", "simulation"]
 name = "sirraya_qutub"
 path = "src/lib.rs"
 doctest = true
+# Opt this crate's functions/types out of docs.rs's "scrape examples"
+# feature (-Z rustdoc-scrape-examples), which was crashing rustdoc itself
+# with an internal panic in its syntax highlighter (`exit_elem` called on
+# empty class stack parent) while trying to embed highlighted call-site
+# snippets into the generated docs. This is a rustdoc ICE, not a bug in
+# this crate -- disabling scraping sidesteps the code path that panics.
+doc-scrape-examples = false
 
 [[bin]]
 name = "sirraya-qutub"
 path = "src/main.rs"
+# Avoid the bin/lib output-filename collision (cargo#6313): with an
+# explicit [lib] name of `sirraya_qutub`, the bin target `sirraya-qutub`
+# normalizes to the same doc output path and one target's rustdoc output
+# silently overwrites the other's.
 doc = false
 
 [dependencies]
@@ -37,6 +48,7 @@ opt-level = 3
 lto = true
 codegen-units = 1
 
+# docs.rs configuration
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
