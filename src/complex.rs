@@ -125,7 +125,7 @@ impl Neg for Complex {
 }
 
 /// Formats as `a+bi` / `a-bi`, dropping the real or imaginary part
-/// when it is negligible (below [`EPSILON`]) and omitting the `+` sign
+/// when it is negligible (below `EPSILON`) and omitting the `+` sign
 /// before a negative imaginary part. Fixed at 6 decimal places.
 impl fmt::Display for Complex {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
