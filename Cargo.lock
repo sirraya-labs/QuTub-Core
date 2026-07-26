@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "sirraya-qutub"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "rand",
 ]
