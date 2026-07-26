@@ -5,6 +5,7 @@
 //! ```
 //! use sirraya_qutub::{QuantumRegister, create_bell_state};
 //!
+//! # fn main() -> Result<(), String> {
 //! // Build a Bell state (|00> + |11>) / sqrt(2) and inspect it.
 //! let bell = create_bell_state()?;
 //! assert!((bell.fidelity(&bell)? - 1.0).abs() < 1e-9);
@@ -15,7 +16,8 @@
 //! reg.apply_cnot(0, 1)?;
 //! let outcome = reg.measure_all_qubits()?;
 //! assert_eq!(outcome.len(), 2);
-//! # Ok::<(), String>(())
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Modules
